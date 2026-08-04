@@ -1,0 +1,77 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+#
+# User scope: ONLY the core backend modules
+#   internal/application, internal/agent, internal/handler, internal/types, internal/models
+# Everything else is excluded explicitly below.
+
+# --- Top-level non-core dirs ---
+cli/
+client/
+cmd/
+config/
+dataset/
+deploy/
+docker/
+docreader/
+examples/
+Formula/
+frontend/
+helm/
+migrations/
+miniprogram/
+misc/
+mcp-server/
+packages/
+scripts/
+skills/
+testdata/
+tests/
+.github/
+docs/
+.venv/
+
+# --- internal/ non-core subdirs (keep only the five core modules) ---
+internal/im/
+internal/infrastructure/
+internal/datasource/
+internal/middleware/
+internal/router/
+internal/utils/
+internal/modelcontext/
+internal/tracing/
+internal/container/
+internal/mcp/
+internal/sandbox/
+internal/searchutil/
+internal/event/
+internal/common/
+internal/runtime/
+internal/errors/
+internal/logger/
+internal/stream/
+internal/assets/
+internal/config/
+internal/ratelimit/
+internal/storageallowlist/
+internal/database/
+
+# --- Root-level non-code files ---
+/*.md
+/*.toml
+/Makefile
+/LICENSE
+/VERSION
+/.air.toml
+/.dockerignore
+/.env.example
+/.env.lite.example
+/.gitattributes
+/.golangci.yml
+/test_agent_config.sh
+/rerank_server_demo.py
+/docker-compose.yml
+/docker-compose.dev.yml
+/package-lock.json
+/CHANGELOG.md
+/SECURITY.md

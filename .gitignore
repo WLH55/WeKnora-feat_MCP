@@ -4,6 +4,16 @@
 !.env.example
 !.gitignore
 !.github/
+# 跟踪 understand-anything 知识图谱产物（父目录 .understand-anything 本身被 .* 排除，需逐级恢复）
+!/.understand-anything/
+/.understand-anything/*
+!.understand-anything/knowledge-graph.json
+!.understand-anything/fingerprints.json
+!.understand-anything/meta.json
+!.understand-anything/config.json
+!.understand-anything/.understandignore
+!.understand-anything/intermediate/
+!.understand-anything/intermediate/scan-result.json
 
 # 敏感文件
 *.pem
