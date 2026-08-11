@@ -1,4 +1,4 @@
-.PHONY: help build run test clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs install-swagger build-lite run-lite package-lite
+.PHONY: help build run test clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs install-swagger build-lite run-lite stop-lite package-lite
 
 # Show help
 help:
@@ -61,6 +61,7 @@ help:
 	@echo "Lite 模式（零外部依赖）:"
 	@echo "  build-lite        构建 Lite 版本（先构建前端到 web/，再构建 Go；SKIP_FRONTEND=1 跳过前端）"
 	@echo "  run-lite          构建并启动 Lite 版本"
+	@echo "  stop-lite         停止 Lite 进程（pkill WeKnora-lite）"
 	@echo "  package-lite      构建并打包 Lite 发行包（tarball）"
 	@echo "  package-mac-app   构建并打包 macOS 桌面应用 (.app)"
 
@@ -269,6 +270,13 @@ build-lite:
 run-lite: build-lite
 	@if [ ! -f .env.lite ]; then echo "Error: .env.lite not found"; exit 1; fi
 	@set -a && . ./.env.lite && set +a && ./$(BINARY_NAME)-lite
+
+# Stop the Lite process (pkill matches ./WeKnora-lite by command line)
+# Lite is a bare process (no docker/systemd), so stop = pkill.
+stop-lite:
+	@echo "Stopping WeKnora-lite..."
+	@-pkill -f "$(BINARY_NAME)-lite" 2>/dev/null || echo "No WeKnora-lite process found"
+	@echo "Done."
 
 # Package Lite version into distributable tarball
 package-lite:

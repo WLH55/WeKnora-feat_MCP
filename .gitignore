@@ -47,6 +47,8 @@ data/files/
 data/weknora.db
 data/weknora.db-wal
 data/weknora.db-shm
+# docker 版数据库/文件 bind mount 目录（数据不应入库）
+data/docker/
 skills-lock.json
 
 web/
