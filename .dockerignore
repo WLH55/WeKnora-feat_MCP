@@ -46,6 +46,10 @@ cmd/desktop/build/bin/
 
 # 本地数据 / 模型文件
 /models/
+# docker 运行数据（postgres/clickhouse/minio 等 bind mount 目录），
+# 仅运行时挂载使用，不进镜像；且内含 JUNCTION 等特殊文件会导致 BuildKit
+# 构建上下文上传失败（invalid file request）。
+data/docker/
 data/files/
 data/*.db
 data/*.db-wal

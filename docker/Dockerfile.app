@@ -19,7 +19,7 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
         sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get update && \
-    apt-get install -y git build-essential libsqlite3-dev
+    apt-get install -y git build-essential libsqlite3-dev ca-certificates
 
 # Install migrate tool
 RUN go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
@@ -57,12 +57,15 @@ ARG APK_MIRROR_ARG
 # Create a non-root user first
 RUN useradd -m -s /bin/bash appuser
 
-# First, install ca-certificates without mirror to ensure HTTPS works
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Install the CA bundle by copying it from the builder image instead of
+# apt-installing it here: the final stage starts without ca-certificates,
+# and apt mirrors in some networks (e.g. mirrors.tencent.com) redirect
+# HTTP to HTTPS, which cannot be verified without the very certificates we
+# are trying to install — while the official deb.debian.org plain-HTTP
+# source may be unreachable (502).
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
-# Then switch to mirror if specified and install other packages
+# Install the remaining runtime packages (via the mirror when configured)
 RUN if [ -n "$APK_MIRROR_ARG" ]; then \
         sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
     fi && \
