@@ -40,11 +40,12 @@ func vlmHTTPTimeout() time.Duration {
 
 // RemoteAPIVLM implements VLM via an OpenAI-compatible chat completions API.
 type RemoteAPIVLM struct {
-	modelName   string
-	modelID     string
-	client      *openai.Client
-	baseURL     string
-	temperature float32
+	modelName    string
+	modelID      string
+	client       *openai.Client
+	baseURL      string
+	temperature  float32
+	providerName provider.ProviderName
 }
 
 // NewRemoteAPIVLM creates a remote-API backed VLM instance.
@@ -98,11 +99,12 @@ func NewRemoteAPIVLM(config *Config) (*RemoteAPIVLM, error) {
 	}
 
 	return &RemoteAPIVLM{
-		modelName:   config.ModelName,
-		modelID:     config.ModelID,
-		client:      openai.NewClientWithConfig(apiCfg),
-		baseURL:     config.BaseURL,
-		temperature: temp,
+		modelName:    config.ModelName,
+		modelID:      config.ModelID,
+		client:       openai.NewClientWithConfig(apiCfg),
+		baseURL:      config.BaseURL,
+		temperature:  temp,
+		providerName: providerName,
 	}, nil
 }
 
@@ -126,7 +128,7 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 				Type: openai.ChatMessagePartTypeImageURL,
 				ImageURL: &openai.ChatMessageImageURL{
 					URL:    dataURI,
-					Detail: openai.ImageURLDetailAuto,
+					Detail: v.imageDetail(),
 				},
 			})
 		}
@@ -162,6 +164,23 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 	content := resp.Choices[0].Message.Content
 	logger.Infof(ctx, "[VLM] OpenAI response received, len=%d", len(content))
 	return content, nil
+}
+
+// imageDetail returns the image_url detail value to send with each image
+// part. detail is an OpenAI-specific parameter; OpenAI-compatible gateways
+// reject or ignore it (MiniMax answers HTTP 400 "invalid image detail: auto",
+// error 2013 — also reachable through third-party proxies such as a generic
+// provider pointing at a MiniMax gateway). It is therefore only sent to
+// OpenAI / Azure OpenAI; for every other provider the field is omitted
+// (json:"detail,omitempty") and the provider's default image resolution
+// applies.
+func (v *RemoteAPIVLM) imageDetail() openai.ImageURLDetail {
+	switch v.providerName {
+	case provider.ProviderOpenAI, provider.ProviderAzureOpenAI:
+		return openai.ImageURLDetailAuto
+	default:
+		return ""
+	}
 }
 
 func (v *RemoteAPIVLM) GetModelName() string { return v.modelName }

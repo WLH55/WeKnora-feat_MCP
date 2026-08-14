@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -27,11 +28,15 @@ func (c *RemoteAPIChat) ConvertMessages(messages []Message) []openai.ChatComplet
 					})
 				case "image_url":
 					if part.ImageURL != nil {
+						var detail openai.ImageURLDetail
+						if c.supportsImageDetail() {
+							detail = openai.ImageURLDetail(part.ImageURL.Detail)
+						}
 						openaiMsg.MultiContent = append(openaiMsg.MultiContent, openai.ChatMessagePart{
 							Type: openai.ChatMessagePartTypeImageURL,
 							ImageURL: &openai.ChatMessageImageURL{
 								URL:    part.ImageURL.URL,
-								Detail: openai.ImageURLDetail(part.ImageURL.Detail),
+								Detail: detail,
 							},
 						})
 					}
@@ -41,11 +46,15 @@ func (c *RemoteAPIChat) ConvertMessages(messages []Message) []openai.ChatComplet
 			parts := make([]openai.ChatMessagePart, 0, len(msg.Images)+1)
 			for _, imgURL := range msg.Images {
 				resolved := resolveImageURLForLLM(imgURL)
+				var detail openai.ImageURLDetail
+				if c.supportsImageDetail() {
+					detail = openai.ImageURLDetailAuto
+				}
 				parts = append(parts, openai.ChatMessagePart{
 					Type: openai.ChatMessagePartTypeImageURL,
 					ImageURL: &openai.ChatMessageImageURL{
 						URL:    resolved,
-						Detail: openai.ImageURLDetailAuto,
+						Detail: detail,
 					},
 				})
 			}
@@ -90,6 +99,22 @@ func (c *RemoteAPIChat) ConvertMessages(messages []Message) []openai.ChatComplet
 		openaiMessages = append(openaiMessages, openaiMsg)
 	}
 	return openaiMessages
+}
+
+// supportsImageDetail reports whether the provider's API defines the
+// image_url detail parameter. detail is an OpenAI-specific parameter that
+// OpenAI-compatible gateways reject or ignore — MiniMax answers HTTP 400
+// "invalid image detail: auto" (error 2013), also when reached through a
+// generic third-party proxy — so it is only sent to OpenAI / Azure OpenAI.
+// An empty detail is omitted from the wire payload entirely
+// (json:"detail,omitempty").
+func (c *RemoteAPIChat) supportsImageDetail() bool {
+	switch c.provider {
+	case provider.ProviderOpenAI, provider.ProviderAzureOpenAI:
+		return true
+	default:
+		return false
+	}
 }
 
 // BuildChatCompletionRequest 构建标准聊天请求参数（导出供子类使用）。

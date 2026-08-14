@@ -163,6 +163,46 @@ func TestBuildOutbound_ShapeRequest(t *testing.T) {
 	})
 }
 
+// TestBuildOutbound_ImageDetailPerProvider covers the image_url detail field
+// per provider. detail is OpenAI-specific: OpenAI-compatible gateways reject
+// or ignore it (MiniMax answers HTTP 400, error 2013, "invalid image detail:
+// auto" — also reachable through generic third-party proxies), so it is only
+// sent to OpenAI / Azure OpenAI and omitted for every other provider.
+func TestBuildOutbound_ImageDetailPerProvider(t *testing.T) {
+	msgs := []Message{{
+		Role: "user",
+		MultiContent: []MessageContentPart{
+			{Type: "text", Text: "describe the image"},
+			{Type: "image_url", ImageURL: &ImageURL{URL: "data:image/png;base64,AAAA", Detail: "auto"}},
+		},
+	}}
+
+	cases := []struct {
+		name       string
+		provider   string
+		model      string
+		wantDetail bool
+	}{
+		{"openai keeps detail", string(provider.ProviderOpenAI), "gpt-4o", true},
+		{"azure keeps detail", string(provider.ProviderAzureOpenAI), "gpt-4", true},
+		{"minimax omits detail", string(provider.ProviderMiniMax), "MiniMax-M3", false},
+		{"generic omits detail", string(provider.ProviderGeneric), "minimax-m3", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newOutboundChat(t, tc.provider, tc.model, nil)
+			body, _, _, err := c.buildOutbound(msgs, &ChatOptions{}, false)
+			require.NoError(t, err)
+			js := mustJSON(t, body)
+			if tc.wantDetail {
+				assert.Contains(t, js, "\"detail\":\"auto\"")
+			} else {
+				assert.NotContains(t, js, "\"detail\"")
+			}
+		})
+	}
+}
+
 func TestBuildOutbound_GeminiProviderMetadata(t *testing.T) {
 	c := newOutboundChat(t, string(provider.ProviderGemini), "gemini-3-flash-preview", nil)
 	messages := []Message{
