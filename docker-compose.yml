@@ -1,4 +1,4 @@
-services:
+﻿services:
   frontend:
     image: wechatopenai/weknora-ui:${WEKNORA_VERSION:-latest}
     # Requires frontend/dist — run ./scripts/build_frontend_dist.sh before --build
@@ -997,7 +997,10 @@ services:
       # 是否校验 WeKnora 后端 TLS 证书（默认 true；自签证书可设 false）
       - WEKNORA_VERIFY_SSL=${WEKNORA_VERIFY_SSL:-true}
       # 允许上传的目录白名单（逗号分隔；留空禁用文件上传工具）
-      - MCP_ALLOWED_UPLOAD_DIRS=${MCP_ALLOWED_UPLOAD_DIRS:-}
+      - MCP_ALLOWED_UPLOAD_DIRS=${MCP_ALLOWED_UPLOAD_DIRS:-/mcp-uploads}
+    volumes:
+      # 宿主机共享目录：文件放这里即可被 create_knowledge_from_file 直接读取
+      - ./data/docker/mcp-uploads:/mcp-uploads
     depends_on:
       app:
         condition: service_healthy
