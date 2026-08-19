@@ -1566,6 +1566,76 @@
 
 ---
 
+
+---
+
+## 约束与外键一览
+
+> 本节从迁移脚本中提取全部**主键、外键、唯一约束、CHECK 约束**。每张表字段表里的"约束/默认值"列已有零散信息，本节是完整汇总。
+
+### 主键
+
+**单列主键（48 张表）**：
+`tenants.id`、`models.id`、`knowledge_bases.id`、`knowledges.id`、`sessions.id`、`messages.id`、`chunks.id`、`users.id`、`auth_tokens.id`、`knowledge_tags.id`、`mcp_services.id`、`embeddings.id`、`organizations.id`、`organization_members.id`、`kb_shares.id`、`organization_join_requests.id`、`agent_shares.id`、`im_channel_sessions.id`、`im_channels.id`、`data_sources.id`、`sync_logs.id`、`web_search_providers.id`、`vector_stores.id`、`wiki_pages.id`、`wiki_folders.id`、`wiki_page_issues.id`、`task_pending_ops.id`、`task_dead_letters.id`、`mcp_tool_approvals.id`、`tenant_members.id`、`audit_logs.id`、`organization_tenant_members.id`、`tenant_invitations.id`、`system_settings.id`、`knowledge_processing_spans.id`、`embed_channels.id`、`mcp_oauth_clients.id`、`mcp_oauth_tokens.id`、`tenant_api_keys.id`、`message_suggestion_sets.id`、`message_suggestion_events.id`、`storage_backends.id`、`resources.id`、`resource_bindings.id`、`resource_access_grants.id`、`temporary_documents.id`、`wiki_page_revisions.id`、`chunk_revisions.id`
+
+**复合主键（5 张表）**：
+
+| 表 | 主键列 |
+|---|---|
+| `custom_agents` | (`id`, `tenant_id`) — 同一 Agent ID 可存在于多个租户（内置 Agent） |
+| `tenant_disabled_shared_agents` | (`tenant_id`, `agent_id`, `source_tenant_id`) |
+| `user_resource_favorites` | (`user_id`, `tenant_id`, `resource_type`, `resource_id`) |
+| `user_kb_pins` | (`tenant_id`, `user_id`, `kb_id`) |
+| `knowledge_tag_relations` | (`knowledge_id`, `tag_id`) |
+
+### 外键（20 条）
+
+> 注意：数据库层面外键仅用于**组织/分享、IM 会话、数据源、MCP、消息推荐、资源**等周边表。**核心业务表**（knowledge_bases、knowledges、chunks、sessions、messages、embeddings、wiki_pages 等）**不设物理外键**，关联关系由应用层维护（保证软删除 deleted_at 与跨租户/跨库灵活性）。
+
+| 源表.字段 | 目标表(字段) | ON DELETE | 定义方式 |
+|---|---|---|---|
+| `organization_members.organization_id` | organizations(id) | CASCADE | 列级 |
+| `organization_tenant_members.organization_id` | organizations(id) | CASCADE | 列级 |
+| `organization_join_requests.organization_id` | organizations(id) | CASCADE | 列级 |
+| `kb_shares.organization_id` | organizations(id) | CASCADE | 列级 |
+| `kb_shares.knowledge_base_id` | knowledge_bases(id) | CASCADE | 列级 |
+| `agent_shares.organization_id` | organizations(id) | CASCADE | 列级 |
+| `agent_shares`(`agent_id`, `source_tenant_id`) | custom_agents(id, tenant_id) | CASCADE | 表级复合外键 |
+| `users.tenant_id` | tenants(id) | SET NULL | 约束 fk_users_tenant |
+| `auth_tokens.user_id` | users(id) | CASCADE | 约束 fk_auth_tokens_user |
+| `im_channel_sessions.session_id` | sessions(id) | CASCADE | 列级 |
+| `sync_logs.data_source_id` | data_sources(id) | CASCADE | 列级 |
+| `mcp_tool_approvals.service_id` | mcp_services(id) | CASCADE | 列级 |
+| `mcp_oauth_clients.service_id` | mcp_services(id) | CASCADE | 列级 |
+| `mcp_oauth_tokens.service_id` | mcp_services(id) | CASCADE | 列级 |
+| `tenant_api_keys.tenant_id` | tenants(id) | CASCADE | 列级 |
+| `message_suggestion_sets.tenant_id` | tenants(id) | CASCADE | 列级 |
+| `message_suggestion_events.tenant_id` | tenants(id) | CASCADE | 列级 |
+| `message_suggestion_events.suggestion_set_id` | message_suggestion_sets(id) | CASCADE | 列级 |
+| `resource_bindings.resource_id` | resources(id) | CASCADE | 列级 |
+| `resource_access_grants.resource_id` | resources(id) | CASCADE | 列级 |
+
+### UNIQUE 约束
+
+| 表 | 约束 | 说明 |
+|---|---|---|
+| `users` | users_username_key (username) | 用户名唯一 |
+| `users` | users_email_key (email) | 邮箱唯一 |
+| `system_settings` | `key` 列级 UNIQUE | 设置键唯一 |
+| `tenant_api_keys` | `key_hash` 列级 UNIQUE | Key 哈希唯一 |
+| `resources` | `handle` 列级 UNIQUE | 短句柄唯一 |
+| `resource_access_grants` | `token_hash` 列级 UNIQUE | 令牌哈希唯一 |
+| `knowledge_processing_spans` | uq_kpspan_attempt_span (knowledge_id, attempt, span_id) | 同一次尝试内 span 唯一 |
+
+另有**部分唯一索引**（等同唯一约束，按条件生效）：`idx_organizations_invite_code`（未删除且 invite_code 非空）、`idx_knowledge_tags_kb_name`（租户+知识库+标签名）、`idx_tenant_invitations_unique_pending`（pending 且 invitee 非空）、`idx_tenant_invitations_token`（token 非空）、`idx_kb_shares_kb_org`、`idx_agent_shares_agent_org`、`idx_mcp_oauth_tokens_tenant_principal_svc`、`idx_chunks_seq_id`、`idx_knowledge_tags_seq_id`、`embeddings_unique_source`(source_id, source_type)、`idx_message_suggestion_sets_cache_key`。
+
+### CHECK 约束
+
+| 表 | 约束 | 规则 |
+|---|---|---|
+| `im_channels` | chk_im_channels_session_mode | `session_mode` IN ('user', 'thread') |
+| `tenant_api_keys` | chk_tenant_api_keys_scope | `scope_type`='tenant' 时 `tenant_id` 非空；`scope_type`='platform' 时 `tenant_id` 为空且 `full_access`=FALSE |
+
 ## 核心表关系（ER 摘要）
 
 ```
