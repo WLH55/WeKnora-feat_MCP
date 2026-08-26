@@ -69,3 +69,6 @@ fix-docker.sh
 
 # WeChat Mini Program local/private configuration
 miniprogram/project.private.config.json
+
+# 本地工具配置
+reasonix.toml
