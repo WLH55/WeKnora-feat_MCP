@@ -36,6 +36,13 @@ func (s *tenantPolicySettingService) GetBool(context.Context, string, string, bo
 	return s.enabled
 }
 
+// GetString returns the default — the same behavior production shows when
+// the settings row is absent. Without this, calls fall through to the
+// embedded nil interface and panic.
+func (s *tenantPolicySettingService) GetString(_ context.Context, _ string, _ string, def string) string {
+	return def
+}
+
 func (s *tenantPolicySettingService) GetInt(_ context.Context, _ string, _ string, def int64) int64 {
 	return def
 }
@@ -142,5 +149,25 @@ func TestAuthMeProjectsTenantCreationCapability(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"can_create_tenant":false`) {
 		t.Fatalf("response missing capability: %s", w.Body.String())
+	}
+}
+
+func TestResolveDefaultTenantModeTenantlessWhenSelfServiceDisabled(t *testing.T) {
+	// 自助创建关闭时，注册不应发放"注册时给、丢掉后不让再建"的个人
+	// 空间；否则误删唯一空间的账号会死锁在引导页。
+	h := &AuthHandler{
+		configInfo:       &config.Config{Tenant: &config.TenantConfig{}},
+		systemSettingSvc: &tenantPolicySettingService{enabled: false},
+	}
+	if got := h.resolveDefaultTenantMode(context.Background()); got != types.TenantProvisioningTenantless {
+		t.Fatalf("default tenant mode = %q, want tenantless when self-service creation is disabled", got)
+	}
+
+	hEnabled := &AuthHandler{
+		configInfo:       &config.Config{Tenant: &config.TenantConfig{}},
+		systemSettingSvc: &tenantPolicySettingService{enabled: true},
+	}
+	if got := hEnabled.resolveDefaultTenantMode(context.Background()); got != types.TenantProvisioningCreatePersonal {
+		t.Fatalf("default tenant mode = %q, want create_personal when self-service creation is enabled", got)
 	}
 }

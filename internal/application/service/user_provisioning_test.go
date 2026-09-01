@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -92,5 +93,49 @@ func TestResolveLoginTenantIDRepairsTenantlessUserWithMembership(t *testing.T) {
 	}
 	if repo.updatedTenant != 42 || user.TenantID != 42 {
 		t.Fatalf("repair was not persisted: repo=%d user=%d", repo.updatedTenant, user.TenantID)
+	}
+}
+
+// deadHomeTenantService simulates soft-deleted tenants: GetTenantByID errors
+// for every id listed in missing (e.g. the workspace was deleted while
+// users.tenant_id kept pointing at it).
+type deadHomeTenantService struct {
+	interfaces.TenantService
+	missing map[uint64]bool
+}
+
+func (s *deadHomeTenantService) GetTenantByID(_ context.Context, id uint64) (*types.Tenant, error) {
+	if s.missing[id] {
+		return nil, errors.New("record not found")
+	}
+	return &types.Tenant{ID: id}, nil
+}
+
+func TestResolveLoginTenantIDFallsBackWhenHomeTenantDeleted(t *testing.T) {
+	repo := &provisioningUserRepo{}
+	tenantSvc := &deadHomeTenantService{missing: map[uint64]bool{7: true}}
+	memberSvc := &provisioningMemberService{members: []*types.TenantMember{
+		{TenantID: 42, Status: types.TenantMemberStatusActive},
+	}}
+	svc := &userService{userRepo: repo, tenantService: tenantSvc, memberService: memberSvc}
+	user := &types.User{ID: "alice", TenantID: 7}
+
+	if got := svc.resolveLoginTenantID(context.Background(), user); got != 42 {
+		t.Fatalf("resolved tenant = %d, want 42 (first active membership)", got)
+	}
+	if repo.updatedTenant != 42 {
+		t.Fatalf("stale home pointer not repaired: persisted tenant %d, want 42", repo.updatedTenant)
+	}
+}
+
+func TestResolveLoginTenantIDTenantlessWhenHomeDeletedAndNoMembership(t *testing.T) {
+	repo := &provisioningUserRepo{}
+	tenantSvc := &deadHomeTenantService{missing: map[uint64]bool{7: true}}
+	memberSvc := &provisioningMemberService{}
+	svc := &userService{userRepo: repo, tenantService: tenantSvc, memberService: memberSvc}
+	user := &types.User{ID: "alice", TenantID: 7}
+
+	if got := svc.resolveLoginTenantID(context.Background(), user); got != 0 {
+		t.Fatalf("resolved tenant = %d, want 0 (tenantless)", got)
 	}
 }
