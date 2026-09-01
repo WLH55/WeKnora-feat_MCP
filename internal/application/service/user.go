@@ -771,17 +771,27 @@ func (s *userService) resolveLoginTenantID(ctx context.Context, user *types.User
 
 // homeOrFirstMembershipTenant returns the user's home tenant, or — for a
 // tenantless identity (TenantID == 0) — the earliest active membership.
-// Shared by the happy path and the stale-preference fallbacks so a
-// tenantless session with a valid membership never gets a zero-tenant
-// token when a usable tenant is available (repairs partial
-// invitation/admin-assignment flows). resolveFirstMembershipTenant
-// best-effort persists the resolved tenant as the new home.
+// A home tenant whose row no longer exists (workspace deleted while the
+// users.tenant_id pointer kept targeting it) is treated the same as no home:
+// fall back to the earliest active membership, repairing the stale pointer
+// via resolveFirstMembershipTenant's persist step. Shared by the happy path
+// and the stale-preference fallbacks so a tenantless session with a valid
+// membership never gets a zero-tenant token when a usable tenant is
+// available (repairs partial invitation/admin-assignment flows).
 func (s *userService) homeOrFirstMembershipTenant(ctx context.Context, user *types.User) uint64 {
 	if user == nil {
 		return 0
 	}
 	if user.TenantID == 0 {
 		return s.resolveFirstMembershipTenant(ctx, user)
+	}
+	if s.tenantService != nil {
+		if _, err := s.tenantService.GetTenantByID(ctx, user.TenantID); err != nil {
+			logger.Warnf(ctx,
+				"resolveLoginTenantID: home tenant %d missing for user %s, falling back to first membership: %v",
+				user.TenantID, user.ID, err)
+			return s.resolveFirstMembershipTenant(ctx, user)
+		}
 	}
 	return user.TenantID
 }

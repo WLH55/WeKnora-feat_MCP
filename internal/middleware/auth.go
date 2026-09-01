@@ -208,9 +208,27 @@ func authenticateJWTUser(
 		return false
 	}
 
-	if targetTenantID == 0 {
-		// 无可用空间：身份级路由（/auth/me 等）放行为 tenantless 会话，
-		// 其余路由返回 TENANT_REQUIRED 让前端引导用户创建/加入空间。
+	// 获取空间信息（X-Tenant-ID 切换路径已在 resolveTargetTenant 内取到，
+	// 避免二次查库）。
+	if tenant == nil && targetTenantID != 0 {
+		var err error
+		tenant, err = tenantService.GetTenantByID(ctx, targetTenantID)
+		if err != nil || tenant == nil {
+			logger.Warnf(ctx, "[auth] tenant lookup failed: tenant=%d user=%s err=%v", targetTenantID, user.ID, err)
+			// JWT 指向的空间已不存在（典型：删除了自己的 home 空间但
+			// token 尚未轮换）。这里不能按 401 拒绝——那会把身份级接口
+			// （/auth/me、邀请收件箱）一并挡死，账号就卡死在引导页。
+			// 先尝试落进用户尚存的最早活跃成员关系，失败再走 tenantless。
+			if recovered := recoverDeadTenantSession(ctx, user, targetTenantID, tenantService, memberService); recovered != nil {
+				targetTenantID, tenant = recovered.ID, recovered
+			}
+		}
+	}
+
+	if tenant == nil {
+		// 无可用空间（含"指向的空间已消失且无成员关系可回退"）：身份级
+		// 路由（/auth/me 等）放行为 tenantless 会话，其余路由返回
+		// TENANT_REQUIRED 让前端引导用户创建/加入空间。
 		if isTenantOptionalAPI(c.Request.URL.Path, c.Request.Method) {
 			attachTenantlessUserContext(c, user)
 			return true
@@ -221,21 +239,6 @@ func authenticateJWTUser(
 		})
 		c.Abort()
 		return false
-	}
-
-	// 获取空间信息（X-Tenant-ID 切换路径已在 resolveTargetTenant 内取到，
-	// 避免二次查库）。
-	if tenant == nil {
-		var err error
-		tenant, err = tenantService.GetTenantByID(ctx, targetTenantID)
-		if err != nil || tenant == nil {
-			logger.Warnf(ctx, "[auth] tenant lookup failed: tenant=%d user=%s err=%v", targetTenantID, user.ID, err)
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "Unauthorized: invalid workspace",
-			})
-			c.Abort()
-			return false
-		}
 	}
 
 	// 解析当前空间内的角色 (issue #1303)
@@ -365,6 +368,36 @@ func resolveFirstMembershipTarget(
 		}
 	}
 	return 0
+}
+
+// recoverDeadTenantSession rescues a session whose resolved target tenant no
+// longer exists (typically a still-valid JWT pointing at a deleted home
+// tenant). It falls back to the earliest active membership — the same
+// self-heal that makes a tenantless session usable right after an invitation
+// is accepted — so a user who already belongs to another workspace is not
+// bounced to the onboarding screen. Returns nil when no usable tenant
+// exists; the caller then applies tenantless semantics instead of a 401
+// lockout.
+func recoverDeadTenantSession(
+	ctx context.Context,
+	user *types.User,
+	deadTenantID uint64,
+	tenantService interfaces.TenantService,
+	memberService interfaces.TenantMemberService,
+) *types.Tenant {
+	if user == nil || tenantService == nil || memberService == nil {
+		return nil
+	}
+	if alt := resolveFirstMembershipTarget(ctx, user, memberService, tenantService); alt > 0 && alt != deadTenantID {
+		tenant, err := tenantService.GetTenantByID(ctx, alt)
+		if err == nil && tenant != nil {
+			logger.Infof(ctx,
+				"[auth] recovered session of user %s into tenant %d after tenant %d disappeared",
+				user.ID, alt, deadTenantID)
+			return tenant
+		}
+	}
+	return nil
 }
 
 func authenticateAPIKeyRequest(
