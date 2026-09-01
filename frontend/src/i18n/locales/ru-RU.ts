@@ -2975,6 +2975,7 @@ export default {
       confirmHint: 'Type the workspace name "{name}" to confirm deletion.',
       confirm: 'Delete workspace',
       nameMismatch: 'Workspace name does not match',
+      lastWorkspaceDisabled: 'This is your last workspace and cannot be deleted. Create or join another workspace first.',
       success: 'Workspace deleted',
       failed: 'Failed to delete workspace'
     },
@@ -4296,7 +4297,7 @@ export default {
       create: 'Создать пространство',
       invitations: 'Посмотреть приглашения',
       loadingPolicy: 'Проверяем доступные способы присоединения…',
-      policyLoadFailed: 'Не удалось загрузить разрешения пространства. Проверьте подключение и повторите попытку.',
+      policyLoadFailed: 'Не удалось загрузить разрешения пространства. Повторите попытку позже.',
       retry: 'Повторить',
       inviteOnlyTitle: 'Ожидание приглашения в пространство',
       inviteOnlyDescription: 'Создание личных пространств отключено. Просмотрите и примите приглашение администратора.',

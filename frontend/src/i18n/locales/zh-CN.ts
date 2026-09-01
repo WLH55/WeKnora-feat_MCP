@@ -2975,6 +2975,7 @@ export default {
       confirmHint: '请输入空间名称「{name}」以确认删除。',
       confirm: '确认删除',
       nameMismatch: '空间名称不匹配',
+      lastWorkspaceDisabled: '这是你当前所属的最后一个空间，无法删除。请先创建或加入其他空间后再删除。',
       success: '空间已删除',
       failed: '删除空间失败'
     },
@@ -4296,7 +4297,7 @@ export default {
       create: '创建空间',
       invitations: '查看邀请',
       loadingPolicy: '正在确认可用的空间加入方式…',
-      policyLoadFailed: '暂时无法获取空间权限，请检查网络后重试。',
+      policyLoadFailed: '暂时无法获取空间权限，请稍后重试。',
       retry: '重新加载',
       inviteOnlyTitle: '等待加入工作空间',
       inviteOnlyDescription: '当前系统不开放个人创建空间。你可以查看并接受管理员发来的空间邀请。',

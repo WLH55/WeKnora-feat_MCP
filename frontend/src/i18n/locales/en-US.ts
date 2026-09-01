@@ -1472,7 +1472,7 @@ export default {
       create: 'Create workspace',
       invitations: 'View invitations',
       loadingPolicy: 'Checking the available workspace options…',
-      policyLoadFailed: 'Workspace permissions could not be loaded. Check your connection and try again.',
+      policyLoadFailed: 'Workspace permissions could not be loaded. Please try again later.',
       retry: 'Reload',
       inviteOnlyTitle: 'Waiting for a workspace invitation',
       inviteOnlyDescription: 'Personal workspace creation is disabled. View and accept an invitation from a workspace administrator.',
@@ -2775,6 +2775,7 @@ export default {
       confirmHint: 'Type the workspace name "{name}" to confirm deletion.',
       confirm: 'Delete workspace',
       nameMismatch: 'Workspace name does not match',
+      lastWorkspaceDisabled: 'This is your last workspace and cannot be deleted. Create or join another workspace first.',
       success: 'Workspace deleted',
       failed: 'Failed to delete workspace'
     },

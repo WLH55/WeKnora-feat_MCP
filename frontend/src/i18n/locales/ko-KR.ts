@@ -2975,6 +2975,7 @@ export default {
       confirmHint: 'Type the workspace name "{name}" to confirm deletion.',
       confirm: 'Delete workspace',
       nameMismatch: 'Workspace name does not match',
+      lastWorkspaceDisabled: 'This is your last workspace and cannot be deleted. Create or join another workspace first.',
       success: 'Workspace deleted',
       failed: 'Failed to delete workspace'
     },
@@ -4296,7 +4297,7 @@ export default {
       create: '공간 만들기',
       invitations: '초대 보기',
       loadingPolicy: '사용 가능한 공간 참여 방식을 확인하고 있습니다…',
-      policyLoadFailed: '공간 권한을 불러올 수 없습니다. 네트워크를 확인한 후 다시 시도하세요.',
+      policyLoadFailed: '공간 권한을 불러올 수 없습니다. 잠시 후 다시 시도하세요.',
       retry: '다시 불러오기',
       inviteOnlyTitle: '작업 공간 초대 대기',
       inviteOnlyDescription: '개인 공간 만들기가 비활성화되어 있습니다. 관리자가 보낸 초대를 확인하고 수락하세요.',

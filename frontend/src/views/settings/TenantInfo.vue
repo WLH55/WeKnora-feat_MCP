@@ -205,9 +205,12 @@
           <div class="leave-space-panel-text">
             <div class="leave-space-panel-title">{{ $t('tenant.deleteDangerZone.title') }}</div>
             <p class="leave-space-panel-desc">{{ $t('tenant.deleteDangerZone.desc') }}</p>
+            <p v-if="isLastWorkspace" class="leave-space-panel-desc delete-space-last-hint">
+              {{ $t('tenant.deleteDangerZone.lastWorkspaceDisabled') }}
+            </p>
           </div>
           <div class="leave-space-panel-action">
-            <t-button theme="danger" size="medium" @click="confirmDeleteTenant">
+            <t-button theme="danger" size="medium" :disabled="isLastWorkspace" @click="confirmDeleteTenant">
               {{ $t('tenant.deleteDangerZone.button') }}
             </t-button>
           </div>
@@ -303,6 +306,11 @@ const showDeleteDangerZone = computed(() => {
   return authStore.hasRole('owner')
 })
 
+/** 最后一个空间不可删：删除后账号将不属于任何空间，且策略上可能无法
+ * 自行创建新空间（后端 LastWorkspaceDeleteDenied 守卫是最终裁判，这里
+ * 只做 UI 防呆；memberships 均为 active 成员关系）。 */
+const isLastWorkspace = computed(() => (authStore.memberships ?? []).length <= 1)
+
 async function evaluateLeaveGate(): Promise<void> {
   leaveGateReady.value = false
   leaveMembersSnap.value = []
@@ -371,6 +379,11 @@ function confirmDeleteTenant() {
   const tid = Number(tenantInfo.value?.id ?? 0)
   const tenantName = tenantInfo.value?.name || ''
   if (!tid || !tenantName) return
+  if (isLastWorkspace.value) {
+    // memberships 快照可能过期；后端守卫是权威，这里提前给出可读提示。
+    MessagePlugin.warning(t('tenant.deleteDangerZone.lastWorkspaceDisabled'))
+    return
+  }
   deleteConfirmName.value = ''
   deleteTenantVisible.value = true
 }
@@ -871,6 +884,11 @@ onMounted(() => {
   font-size: 13px;
   line-height: 1.55;
   color: var(--td-text-color-secondary);
+}
+
+.delete-space-last-hint {
+  margin-top: 4px;
+  color: var(--td-warning-color);
 }
 
 .leave-space-panel-action {
