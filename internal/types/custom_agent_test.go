@@ -8,7 +8,8 @@ func TestCustomAgentConfigResolveChatParserEngine(t *testing.T) {
 		{FileTypes: []string{"png", "jpg"}, Engine: "paddleocr_vl"},
 	}}
 	for input, expected := range map[string]string{
-		"PDF": "mineru", ".pptx": "mineru", "png": "paddleocr_vl", "txt": "",
+		"PDF": "mineru", ".pptx": "mineru", "png": "paddleocr_vl",
+		"txt": "", "ppt": "markitdown",
 	} {
 		if actual := config.ResolveChatParserEngine(input); actual != expected {
 			t.Fatalf("ResolveChatParserEngine(%q) = %q, want %q", input, actual, expected)
@@ -17,6 +18,9 @@ func TestCustomAgentConfigResolveChatParserEngine(t *testing.T) {
 	var nilConfig *CustomAgentConfig
 	if actual := nilConfig.ResolveChatParserEngine("pdf"); actual != "" {
 		t.Fatalf("nil config resolved %q", actual)
+	}
+	if actual := nilConfig.ResolveChatParserEngine("pptx"); actual != "markitdown" {
+		t.Fatalf("nil config pptx resolved %q, want markitdown", actual)
 	}
 }
 
@@ -37,6 +41,32 @@ func TestEnsureDefaults_ThinkingPreservesTrue(t *testing.T) {
 	agent.EnsureDefaults()
 	if agent.Config.Thinking == nil || !*agent.Config.Thinking {
 		t.Fatal("EnsureDefaults must not overwrite an explicit Thinking=true")
+	}
+}
+
+func TestEnsureDefaults_MaxCompletionTokensByMode(t *testing.T) {
+	qa := &CustomAgent{Config: CustomAgentConfig{AgentMode: AgentModeQuickAnswer}}
+	qa.EnsureDefaults()
+	if qa.Config.MaxCompletionTokens != 0 {
+		t.Fatalf("unset max_completion_tokens must stay 0 (follow default at call time), got %d",
+			qa.Config.MaxCompletionTokens)
+	}
+
+	sr := &CustomAgent{Config: CustomAgentConfig{AgentMode: AgentModeSmartReasoning}}
+	sr.EnsureDefaults()
+	if sr.Config.MaxCompletionTokens != 0 {
+		t.Fatalf("unset smart-reasoning max_completion_tokens must stay 0, got %d",
+			sr.Config.MaxCompletionTokens)
+	}
+
+	explicit := &CustomAgent{Config: CustomAgentConfig{
+		AgentMode:           AgentModeSmartReasoning,
+		MaxCompletionTokens: 64000,
+	}}
+	explicit.EnsureDefaults()
+	if explicit.Config.MaxCompletionTokens != 64000 {
+		t.Fatalf("EnsureDefaults must preserve explicit MaxCompletionTokens, got %d",
+			explicit.Config.MaxCompletionTokens)
 	}
 }
 

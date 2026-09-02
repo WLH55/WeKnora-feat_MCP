@@ -177,6 +177,21 @@
       <div class="form-panel">
         <!-- Login Card -->
         <div class="form-card" v-if="!isRegisterMode">
+          <!-- invite_only 模式下共享链接停在登录卡，同样需要邀请上下文。 -->
+          <div v-if="inviteLookup" class="invite-banner">
+            <t-icon name="link" class="invite-banner__icon" />
+            <div class="invite-banner__text">
+              <div class="invite-banner__title">
+                {{ $t('inviteRegister.bannerTitle', { tenant: inviteLookup.tenant_name || '' }) }}
+              </div>
+              <div class="invite-banner__hint">
+                {{ $t('inviteRegister.bannerHintLogin') }}
+              </div>
+            </div>
+          </div>
+          <div v-else-if="inviteLookupError" class="invite-banner invite-banner--error">
+            {{ inviteLookupError }}
+          </div>
           <div class="form-header">
             <h2 class="form-title">{{ $t('auth.login') }}</h2>
             <p class="form-welcome">{{ $t('auth.subtitle') }}</p>
@@ -329,6 +344,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useRoleLabel } from '@/composables/useRoleLabel'
 import { notifyLoginSuccess } from '@/utils/loginNotify'
+import { newPasswordRules } from '@/utils/passwordPolicy'
 import { Swiper, SwiperSlide } from 'swiper/vue'
 import { Autoplay, EffectFade, Pagination } from 'swiper/modules'
 import 'swiper/css'
@@ -403,6 +419,7 @@ const oidcProviderName = ref('')
 // link is visible; the actual mode is fetched from /auth/config in onMounted.
 // In invite_only mode the link/card are hidden.
 const registrationEnabled = ref(true)
+const complexPasswordEnabled = ref(false)
 
 // invite-link state. When the URL carries ?token=xxx we resolve it to
 // the originating tenant + role and switch the form into a "register
@@ -455,10 +472,8 @@ const formRules = computed(() => ({
   password: [
     { required: true, message: t('auth.passwordRequired'), type: 'error' },
     { min: 8, message: t('auth.passwordMinLength'), type: 'error' },
-    { max: 32, message: t('auth.passwordMaxLength'), type: 'error' },
-    { pattern: /[a-zA-Z]/, message: t('auth.passwordMustContainLetter'), type: 'error' },
-    { pattern: /\d/, message: t('auth.passwordMustContainNumber'), type: 'error' }
-  ]
+    { max: 32, message: t('auth.passwordMaxLength'), type: 'error' }
+  ],
 }))
 
 // Register form validation rules
@@ -477,13 +492,7 @@ const registerRules = computed(() => ({
     { required: true, message: t('auth.emailRequired'), type: 'error' },
     { email: true, message: t('auth.emailInvalid'), type: 'error' }
   ],
-  password: [
-    { required: true, message: t('auth.passwordRequired'), type: 'error' },
-    { min: 8, message: t('auth.passwordMinLength'), type: 'error' },
-    { max: 32, message: t('auth.passwordMaxLength'), type: 'error' },
-    { pattern: /[a-zA-Z]/, message: t('auth.passwordMustContainLetter'), type: 'error' },
-    { pattern: /\d/, message: t('auth.passwordMustContainNumber'), type: 'error' }
-  ],
+  password: newPasswordRules(t, complexPasswordEnabled.value),
   confirmPassword: [
     { required: true, message: t('auth.confirmPasswordRequired'), type: 'error' },
     {
@@ -533,7 +542,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('click', handleClickOutside)
 })
 
-const persistLoginResponse = async (response: any) => {
+const persistLoginResponse = async (response: any, skipRedirect = false) => {
   // Backend renamed `tenant` to `active_tenant` and added `memberships`
   // when tenant-level RBAC landed (issue #1303). The two are otherwise
   // identical — `active_tenant` is the tenant whose ID is encoded in the
@@ -584,6 +593,7 @@ const persistLoginResponse = async (response: any) => {
   // briefly when the deployment is invitation-only.
   await authStore.refreshFromAuthMe()
   await nextTick()
+  if (skipRedirect) return
   router.replace(authStore.hasValidTenant ? '/platform/knowledge-bases' : '/onboarding/workspace')
 }
 
@@ -607,8 +617,10 @@ const loadAuthConfig = async () => {
   try {
     const response = await getAuthConfig()
     registrationEnabled.value = response.registration_mode !== 'invite_only'
+    complexPasswordEnabled.value = response.complex_password_enabled
   } catch {
     registrationEnabled.value = true
+    complexPasswordEnabled.value = false
   }
 }
 
@@ -623,12 +635,35 @@ const handleOIDCLogin = async () => {
       return
     }
 
+    // 跳转 IdP 会丢失 URL 中的 token，暂存到 sessionStorage，回调后由 App.vue 兑换。
+    if (inviteToken.value) {
+      sessionStorage.setItem('weknora_pending_invite_token', inviteToken.value)
+    }
     window.location.href = authorizationURL
   } catch (error: any) {
     console.error('OIDC 登录跳转失败:', error)
     MessagePlugin.error(error.message || t('auth.oidcLoginFailed'))
   } finally {
     oidcLoading.value = false
+  }
+}
+
+// 用 token 加入空间并进入应用。会话此时已有效，故即便 token 失效也照常进入（避免困在登录页）。
+const acceptAndEnter = async (token: string) => {
+  loading.value = true
+  try {
+    const result = await authStore.acceptInvitationByTokenAndRefresh(token)
+    if (result.ok) {
+      MessagePlugin.success(t('inviteRegister.joined'))
+    } else {
+      MessagePlugin.warning(t('inviteRegister.invalidBody'))
+    }
+  } catch {
+    MessagePlugin.warning(t('inviteRegister.invalidBody'))
+  } finally {
+    loading.value = false
+    await nextTick()
+    router.replace('/platform/knowledge-bases')
   }
 }
 
@@ -646,6 +681,12 @@ const handleLogin = async () => {
     })
 
     if (response.success) {
+      if (inviteToken.value) {
+        // 从邀请链接登录：持久化会话后兑换 token 并进入对应空间。
+        await persistLoginResponse(response, true)
+        await acceptAndEnter(inviteToken.value)
+        return
+      }
       await persistLoginResponse(response)
       notifyLoginSuccess(response, t, tm, formatRole, roleIcon)
     } else {
@@ -731,25 +772,37 @@ onMounted(async () => {
   if (tokenFromQuery) {
     inviteToken.value = tokenFromQuery
     inviteLookupLoading.value = true
+    // 1. 先校验 token：无效/过期则停在登录页报错，不进注册模式。
     try {
       const resp = await getInvitationByToken(tokenFromQuery)
       if (resp.success && resp.data) {
         inviteLookup.value = resp.data
-        // Token bypasses invite_only — show the register card even
-        // when self-service registration is otherwise disabled.
-        registrationEnabled.value = true
-        isRegisterMode.value = true
       } else {
         inviteLookupError.value = resp.message || t('inviteRegister.invalidBody')
+        loadOIDCConfig()
+        loadAuthConfig()
+        return
       }
     } catch {
       inviteLookupError.value = t('inviteRegister.invalidBody')
+      loadOIDCConfig()
+      loadAuthConfig()
+      return
     } finally {
       inviteLookupLoading.value = false
     }
-    // Don't run auto-setup when the user came in via an invite link —
-    // they're explicitly trying to register, not bootstrap a Lite
-    // single-user instance.
+
+    // 2. 已登录则直接兑换 token 进入空间（两种模式通用）。
+    if (authStore.isLoggedIn && (await authStore.refreshFromAuthMe())) {
+      await acceptAndEnter(tokenFromQuery)
+      return
+    }
+
+    // 3. 未登录：按注册模式决定界面。invite_only 停在登录页、登录后再兑换；self_serve 保持注册流程。
+    const cfg = await getAuthConfig()
+    const inviteOnly = cfg.registration_mode === 'invite_only'
+    registrationEnabled.value = !inviteOnly
+    isRegisterMode.value = !inviteOnly
     loadOIDCConfig()
     return
   }

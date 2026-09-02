@@ -97,7 +97,7 @@ type WikiPageService interface {
 	// RebuildIndexPage regenerates the index page.
 	RebuildIndexPage(ctx context.Context, kbID string) error
 
-	// ListAllPages retrieves all wiki pages in a knowledge base without pagination.
+	// ListAllPages retrieves all non-archived wiki pages in a knowledge base without pagination.
 	// Used for index rebuild, graph generation, cross-link injection, etc.
 	ListAllPages(ctx context.Context, kbID string) ([]*types.WikiPage, error)
 
@@ -152,6 +152,17 @@ type WikiPageService interface {
 	// page titles. Used by the dedup pre-filter to surface candidate
 	// merge targets server-side.
 	FindSimilarPages(ctx context.Context, kbID string, query string, pageTypes []string, limit int) ([]*types.WikiPageLite, error)
+
+	// FindPagesByNormalizedTitle returns non-archived pages of pageType whose
+	// display title matches identity after the same whitespace/case fold used
+	// by wiki ingest identity claims. Used so exact same-title pages are found
+	// even when they miss the trigram top-K.
+	FindPagesByNormalizedTitle(ctx context.Context, kbID, pageType, identity string) ([]*types.WikiPageLite, error)
+
+	// FindPagesByNormalizedTitles is the batched form of
+	// FindPagesByNormalizedTitle. identities are already whitespace-stripped
+	// and lowercased; empty entries are ignored.
+	FindPagesByNormalizedTitles(ctx context.Context, kbID, pageType string, identities []string) ([]*types.WikiPageLite, error)
 
 	// ListDistinctCategoryPaths returns the existing wiki folder paths (split
 	// into segments), capped at maxPaths. Used by wiki ingest's taxonomy
@@ -318,6 +329,14 @@ type WikiPageRepository interface {
 	// surface candidate merge targets server-side.
 	FindSimilarPages(ctx context.Context, kbID string, query string, pageTypes []string, limit int) ([]*types.WikiPageLite, error)
 
+	// FindPagesByNormalizedTitle returns non-archived pages of pageType whose
+	// whitespace-stripped, lowercased title equals identity.
+	FindPagesByNormalizedTitle(ctx context.Context, kbID, pageType, identity string) ([]*types.WikiPageLite, error)
+
+	// FindPagesByNormalizedTitles is the batched form of
+	// FindPagesByNormalizedTitle.
+	FindPagesByNormalizedTitles(ctx context.Context, kbID, pageType string, identities []string) ([]*types.WikiPageLite, error)
+
 	// ListDistinctCategoryPaths returns the materialized paths of existing
 	// wiki folders (split into segments), capped at maxPaths. Used by the
 	// wiki ingest taxonomy planner as the pool of folders to reuse.
@@ -354,7 +373,7 @@ type WikiPageRepository interface {
 	// Used to recompute cached paths when a folder subtree is moved/renamed.
 	ListPagesByFolderIDs(ctx context.Context, kbID string, folderIDs []string) ([]*types.WikiPage, error)
 
-	// ListAll retrieves all wiki pages in a knowledge base (for link rebuilding, graph generation).
+	// ListAll retrieves all non-archived wiki pages in a knowledge base (for link rebuilding, graph generation).
 	ListAll(ctx context.Context, kbID string) ([]*types.WikiPage, error)
 
 	// ListRecentForSuggestions returns recent user-visible wiki pages under the given

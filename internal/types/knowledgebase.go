@@ -107,6 +107,8 @@ type KnowledgeBase struct {
 	FAQConfig *FAQConfig `yaml:"faq_config"              json:"faq_config"              gorm:"column:faq_config;type:json"`
 	// QuestionGenerationConfig stores question generation configuration for document knowledge bases
 	QuestionGenerationConfig *QuestionGenerationConfig `yaml:"question_generation_config" json:"question_generation_config" gorm:"column:question_generation_config;type:json"`
+	// AutoTagConfig controls asynchronous association of existing tags after parsing.
+	AutoTagConfig *AutoTagConfig `yaml:"auto_tag_config" json:"auto_tag_config" gorm:"type:json"`
 	// WikiConfig stores wiki-specific configuration (only for wiki type knowledge bases)
 	WikiConfig *WikiConfig `yaml:"wiki_config"             json:"wiki_config"             gorm:"column:wiki_config;type:json"`
 	// IndexingStrategy controls which indexing pipelines are active for this knowledge base.
@@ -156,9 +158,77 @@ type KnowledgeBaseConfig struct {
 	FAQConfig *FAQConfig `yaml:"faq_config"              json:"faq_config"`
 	// Wiki configuration (only for wiki-enabled knowledge bases)
 	WikiConfig *WikiConfig `yaml:"wiki_config"             json:"wiki_config"`
+	// AutoTagConfig controls optional automatic association of existing KB tags.
+	AutoTagConfig *AutoTagConfig `yaml:"auto_tag_config" json:"auto_tag_config"`
 	// IndexingStrategy controls which indexing pipelines are active.
 	// nil means "no change" when updating (preserves existing strategy).
 	IndexingStrategy *IndexingStrategy `yaml:"indexing_strategy"       json:"indexing_strategy"`
+}
+
+const (
+	// DefaultAutoTagMaxTags is applied when max_tags is unset or non-positive.
+	DefaultAutoTagMaxTags = 3
+	// MaximumAutoTagMaxTags caps how many tags one document may auto-acquire.
+	MaximumAutoTagMaxTags = 10
+)
+
+// AutoTagConfig controls asynchronous document auto-tagging. It is deliberately
+// opt-in so upgrading an existing deployment does not add model calls or alter
+// document tags unexpectedly.
+type AutoTagConfig struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	ModelID string `yaml:"model_id,omitempty" json:"model_id,omitempty"`
+	MaxTags int    `yaml:"max_tags,omitempty" json:"max_tags,omitempty"`
+	// SkipIfTagged leaves documents that already carry tags untouched, so a
+	// deliberate manual classification is not diluted by model guesses. It is
+	// a pointer because the default is true: rows written before this field
+	// existed decode to nil and must not silently flip to "always append".
+	SkipIfTagged *bool `yaml:"skip_if_tagged,omitempty" json:"skip_if_tagged,omitempty"`
+}
+
+// ShouldSkipIfTagged reports whether documents with existing tags are left
+// alone. Defaults to true for nil receivers and unset values.
+func (c *AutoTagConfig) ShouldSkipIfTagged() bool {
+	if c == nil || c.SkipIfTagged == nil {
+		return true
+	}
+	return *c.SkipIfTagged
+}
+
+// Value serializes the automatic-tagging configuration for database storage.
+func (c AutoTagConfig) Value() (driver.Value, error) { return json.Marshal(c) }
+
+// Scan deserializes the automatic-tagging configuration from a database value.
+func (c *AutoTagConfig) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+	b, ok := value.([]byte)
+	if !ok {
+		if s, ok := value.(string); ok {
+			b = []byte(s)
+		} else {
+			return nil
+		}
+	}
+	return json.Unmarshal(b, c)
+}
+
+// Normalize applies defaults and bounds to the automatic-tagging configuration.
+func (c *AutoTagConfig) Normalize() {
+	if c == nil {
+		return
+	}
+	if c.MaxTags <= 0 {
+		c.MaxTags = DefaultAutoTagMaxTags
+	}
+	if c.MaxTags > MaximumAutoTagMaxTags {
+		c.MaxTags = MaximumAutoTagMaxTags
+	}
+	if c.SkipIfTagged == nil {
+		skip := true
+		c.SkipIfTagged = &skip
+	}
 }
 
 // ParserEngineRule maps a set of file types to a specific parser engine.
@@ -179,7 +249,10 @@ type ChunkingConfig struct {
 	// Separators
 	Separators []string `yaml:"separators"    json:"separators"`
 	// ParserEngineRules configures which parser engine to use for each file type.
-	// When empty, the builtin engine is used for all types.
+	// When empty, DefaultParserEngine is used (builtin/simple routing, except
+	// types that only a specific engine can parse: ppt/pptx fall back to
+	// markitdown). A linked anydoc binding is preferred for every type it
+	// converts.
 	ParserEngineRules []ParserEngineRule `yaml:"parser_engine_rules,omitempty" json:"parser_engine_rules,omitempty"`
 	// EnableParentChild enables two-level parent-child chunking strategy.
 	// When enabled, large parent chunks provide context while small child chunks
@@ -208,14 +281,49 @@ type ChunkingConfig struct {
 	TableMetadataInstructions string `yaml:"table_metadata_instructions,omitempty" json:"table_metadata_instructions,omitempty"`
 }
 
+// defaultParserEngineByType maps file types the builtin/simple engines cannot
+// parse to a docreader engine that can. Types omitted here keep empty-string
+// routing (Go simple formats, otherwise docreader builtin) unless
+// SetPreferParserEngine selects a linked in-process engine such as anydoc.
+var defaultParserEngineByType = map[string]string{
+	"ppt":  "markitdown",
+	"pptx": "markitdown",
+}
+
+// preferParserEngine, if set, may override DefaultParserEngine. The
+// docparser package registers anydoc here so types does not import the
+// engine catalog.
+var preferParserEngine func(fileType string) string
+
+// SetPreferParserEngine registers a build-time preference used by
+// DefaultParserEngine. Pass nil to clear. Intended to be called from init().
+func SetPreferParserEngine(fn func(fileType string) string) {
+	preferParserEngine = fn
+}
+
+// DefaultParserEngine returns the engine used when no parser_engine_rules
+// match. Empty string means builtin (docreader) or Go simple-format routing.
+// When the anydoc binding is linked it is preferred for every type it
+// converts (except Go simple formats). ppt/pptx otherwise fall back to
+// markitdown.
+func DefaultParserEngine(fileType string) string {
+	ft := normalizeParserFileType(fileType)
+	if preferParserEngine != nil {
+		if engine := preferParserEngine(ft); engine != "" {
+			return engine
+		}
+	}
+	return defaultParserEngineByType[ft]
+}
+
 // ResolveParserEngine returns the engine name for the given file type
-// based on the configured rules. Returns empty string (builtin) when
-// no rule matches.
+// based on the configured rules. When no rule matches it returns the
+// type-level default (see DefaultParserEngine).
 func (c ChunkingConfig) ResolveParserEngine(fileType string) string {
 	if rule := c.ResolveParserEngineRule(fileType); rule != nil {
 		return rule.Engine
 	}
-	return ""
+	return DefaultParserEngine(fileType)
 }
 
 // ResolveParserEngineRule returns the parser rule for a file type.
@@ -626,6 +734,11 @@ func (kb *KnowledgeBase) EnsureDefaults() {
 	// Clear type-specific configs that don't belong
 	if kb.Type != KnowledgeBaseTypeFAQ {
 		kb.FAQConfig = nil
+	}
+	if kb.Type != KnowledgeBaseTypeDocument {
+		kb.AutoTagConfig = nil
+	} else if kb.AutoTagConfig != nil {
+		kb.AutoTagConfig.Normalize()
 	}
 	// Set defaults for FAQ
 	if kb.Type == KnowledgeBaseTypeFAQ {

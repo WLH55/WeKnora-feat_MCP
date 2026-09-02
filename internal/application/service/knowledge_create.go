@@ -28,11 +28,19 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 ) (*types.Knowledge, error) {
 	logger.Info(ctx, "Start creating knowledge from file")
 
-	// Use custom filename if provided, otherwise use original filename
+	// Use custom filename if provided, otherwise use original filename. Folder
+	// uploads pass a path-qualified name ("docs/spec/design.md"): the directory
+	// part becomes the knowledge's folder_path and only the base name is kept as
+	// the display / storage file name.
 	fileName := file.Filename
+	folderPath := ""
 	if customFileName != "" {
-		fileName = customFileName
-		logger.Infof(ctx, "Using custom filename: %s (original: %s)", customFileName, file.Filename)
+		folderPath, fileName = types.SplitKnowledgeRelativePath(customFileName)
+		if fileName == "" {
+			fileName = file.Filename
+		}
+		logger.Infof(ctx, "Using custom filename: %s (original: %s, folder: %s)",
+			fileName, file.Filename, folderPath)
 	}
 
 	logger.Infof(ctx, "Knowledge base ID: %s, file: %s", kbID, fileName)
@@ -125,6 +133,17 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		return nil, werrors.NewValidationError("文件名包含非法字符")
 	}
 
+	// The folder path is rendered as sidebar tree labels, so it goes through the
+	// same input validation as the file name before it is stored.
+	if folderPath != "" {
+		safeFolderPath, folderValid := secutils.ValidateInput(folderPath)
+		if !folderValid {
+			logger.Errorf(ctx, "Invalid folder path: %s", folderPath)
+			return nil, werrors.NewValidationError("文件夹路径包含非法字符")
+		}
+		folderPath = types.NormalizeKnowledgeFolderPath(safeFolderPath)
+	}
+
 	eff, err := resolveFileImportProcessConfig(ctx, kb, getFileType(safeFilename), processOverrides, enableMultimodel)
 	if err != nil {
 		return nil, err
@@ -140,6 +159,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		Channel:          defaultChannel(channel),
 		Title:            safeFilename,
 		FileName:         safeFilename,
+		FolderPath:       folderPath,
 		FileType:         getFileType(safeFilename),
 		FileSize:         file.Size,
 		FileHash:         hash,
@@ -193,7 +213,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		questionCount = 3
 	}
 
-	lang, _ := types.LanguageFromContext(ctx)
+	lang := types.LanguageFromContextOrDefault(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -391,7 +411,7 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		questionCount = 3
 	}
 
-	lang, _ := types.LanguageFromContext(ctx)
+	lang := types.LanguageFromContextOrDefault(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -633,7 +653,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		questionCount = 3
 	}
 
-	lang, _ := types.LanguageFromContext(ctx)
+	lang := types.LanguageFromContextOrDefault(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -796,6 +816,11 @@ func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 		return nil, err
 	}
 
+	// Claim the body's files immediately, before publishing. A draft saved from
+	// a chat answer must already own them: the message it came from could be
+	// deleted while the draft is still unpublished.
+	s.bindContentResources(ctx, tenantID, knowledge.ID, cleanContent)
+
 	if status == types.ManualKnowledgeStatusPublish {
 		logger.Infof(ctx, "Manual knowledge created, enqueuing async processing task, ID: %s", knowledge.ID)
 		taskID, err := s.enqueueManualProcessing(ctx, knowledge, cleanContent, false)
@@ -907,7 +932,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 			}
 		}
 
-		lang, _ := types.LanguageFromContext(ctx)
+		lang := types.LanguageFromContextOrDefault(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              knowledge.ID,
@@ -1043,6 +1068,7 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 			logger.Errorf(ctx, "Failed to persist manual draft: %v", err)
 			return nil, err
 		}
+		s.bindContentResources(ctx, tenantID, existing.ID, cleanContent)
 		recordKBActivity(ctx, s.audit, tenantID, existing.KnowledgeBaseID, types.AuditActionKnowledgeUpdated,
 			"knowledge", existing.ID, types.AuditOutcomeSuccess, map[string]any{
 				"title": existing.Title, "status": status,
@@ -1158,6 +1184,42 @@ func sanitizeManualDownloadFilename(title string) string {
 	return safeName
 }
 
+// bindContentResources claims every stored file the body references on behalf
+// of a knowledge entry.
+//
+// A manual document routinely points at files it did not upload: an answer saved
+// from a chat carries the very `resource://` handles the assistant message still
+// shows. Claiming them is what makes that copy safe — no bytes are duplicated,
+// and neither the message nor the document can delete a file the other still
+// needs. Handles belonging to another workspace are skipped, so a pasted
+// reference cannot pull in a file the caller may not read.
+//
+// Best-effort by design: the document is already saved, and a missed claim
+// degrades to the old behaviour rather than failing the save.
+func (s *knowledgeService) bindContentResources(
+	ctx context.Context, tenantID uint64, knowledgeID, content string,
+) {
+	if s.resourceCatalog == nil || knowledgeID == "" {
+		return
+	}
+	for _, ref := range types.ScanResourceReferences(content) {
+		resource, err := s.resourceCatalog.Resolve(ctx, ref)
+		if err != nil || resource == nil {
+			logger.Warnf(ctx, "Skip binding unknown resource %s to knowledge %s: %v", ref, knowledgeID, err)
+			continue
+		}
+		if resource.TenantID != tenantID {
+			logger.Warnf(ctx, "Skip binding cross-workspace resource %s to knowledge %s", ref, knowledgeID)
+			continue
+		}
+		if err := s.resourceCatalog.Bind(
+			ctx, ref, types.ResourceOwnerKnowledge, knowledgeID, types.ResourceRelationAttachment,
+		); err != nil {
+			logger.Warnf(ctx, "Failed to bind resource %s to knowledge %s: %v", ref, knowledgeID, err)
+		}
+	}
+}
+
 func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	kb *types.KnowledgeBase, knowledge *types.Knowledge, content string, doSync bool,
 ) {
@@ -1187,6 +1249,15 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 			resolvedImages = append(resolvedImages, storedImages...)
 		}
 	}
+
+	// Re-claim the body's stored files. This runs after cleanupKnowledgeResources
+	// released the previous run's claims, so a republished document keeps the
+	// files its new body still references.
+	s.bindContentResources(ctx, knowledge.TenantID, knowledge.ID, clean)
+
+	// Keep manually entered CRLF text aligned with the LF values sent by the
+	// chunking preview endpoint.
+	clean = chunker.NormalizeLineEndings(clean)
 
 	processOverrides, _ := knowledge.ProcessOverrides()
 	eff := ResolveProcessConfig(kb, processOverrides)

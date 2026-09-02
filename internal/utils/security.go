@@ -18,6 +18,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/net/http/httpproxy"
+
+	"github.com/Tencent/WeKnora/internal/ipclass"
 )
 
 // XSS 防护相关正则表达式
@@ -225,105 +227,38 @@ var restrictedHostSuffixes = []string{
 	".pod.cluster.local",
 }
 
-// restrictedIPv4Ranges contains CIDR ranges that should be blocked
-// These are additional ranges not covered by Go's IsPrivate(), IsLoopback(), etc.
-var restrictedIPv4Ranges = []*net.IPNet{
-	// 100.64.0.0/10 - Carrier-grade NAT (RFC 6598)
-	mustParseCIDR("100.64.0.0/10"),
-	// 198.18.0.0/15 - Network device benchmark testing (RFC 2544)
-	mustParseCIDR("198.18.0.0/15"),
-	// 198.51.100.0/24 - TEST-NET-2 for documentation (RFC 5737)
-	mustParseCIDR("198.51.100.0/24"),
-	// 203.0.113.0/24 - TEST-NET-3 for documentation (RFC 5737)
-	mustParseCIDR("203.0.113.0/24"),
-	// 192.0.0.0/24 - IETF Protocol Assignments (RFC 6890)
-	mustParseCIDR("192.0.0.0/24"),
-	// 192.0.2.0/24 - TEST-NET-1 for documentation (RFC 5737)
-	mustParseCIDR("192.0.2.0/24"),
-	// 0.0.0.0/8 - "This" network (RFC 1122)
-	mustParseCIDR("0.0.0.0/8"),
-	// 240.0.0.0/4 - Reserved for future use (RFC 1112)
-	mustParseCIDR("240.0.0.0/4"),
-	// 255.255.255.255/32 - Limited broadcast
-	mustParseCIDR("255.255.255.255/32"),
-	// Docker bridge network (default range)
-	mustParseCIDR("172.17.0.0/16"),
-	// Docker user-defined bridge networks (commonly used range)
-	mustParseCIDR("172.18.0.0/16"),
-	mustParseCIDR("172.19.0.0/16"),
-	mustParseCIDR("172.20.0.0/16"),
+// restrictedPorts contains non-HTTP service ports that user-controlled URLs
+// must not reach. It is checked both during URL validation and again at dial
+// time so dynamically discovered URLs cannot bypass the input boundary.
+var restrictedPorts = map[string]bool{
+	"22":    true, // SSH
+	"23":    true, // Telnet
+	"25":    true, // SMTP
+	"445":   true, // SMB
+	"3389":  true, // RDP
+	"5432":  true, // PostgreSQL
+	"3306":  true, // MySQL
+	"6379":  true, // Redis
+	"27017": true, // MongoDB
+	"9200":  true, // Elasticsearch
+	"2379":  true, // etcd
+	"2380":  true, // etcd
+	"8500":  true, // Consul
+	"4001":  true, // etcd (old)
 }
 
-// mustParseCIDR parses a CIDR string and panics on error
-func mustParseCIDR(s string) *net.IPNet {
-	_, ipNet, err := net.ParseCIDR(s)
-	if err != nil {
-		panic(fmt.Sprintf("invalid CIDR: %s", s))
-	}
-	return ipNet
-}
-
-// isRestrictedIP checks if an IP address falls within any restricted range
+// isRestrictedIP checks if an IP address falls within any restricted range.
+//
+// The URLs guarded here come from end users, who get no opt-in for internal
+// targets, so every class except ipclass.Public is restricted. Documentation
+// ranges are included in that: they are unroutable, and a user-supplied URL
+// has no legitimate reason to name one.
 func isRestrictedIP(ip net.IP) (bool, string) {
-	// Check Go's built-in methods first
-	if ip.IsPrivate() {
-		return true, "private IP address"
+	class, reason := ipclass.Classify(ip)
+	if class == ipclass.Public {
+		return false, ""
 	}
-	if ip.IsLoopback() {
-		return true, "loopback address"
-	}
-	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true, "link-local address"
-	}
-	if ip.IsMulticast() {
-		return true, "multicast address"
-	}
-	if ip.IsUnspecified() {
-		return true, "unspecified address"
-	}
-
-	// Check IPv4-specific restricted ranges
-	if ip4 := ip.To4(); ip4 != nil {
-		for _, cidr := range restrictedIPv4Ranges {
-			if cidr.Contains(ip4) {
-				return true, fmt.Sprintf("restricted range %s", cidr.String())
-			}
-		}
-	}
-
-	// Check IPv6-specific restrictions
-	if ip.To4() == nil && len(ip) == 16 {
-		// Site-local (deprecated but still blocked): fec0::/10
-		if ip[0] == 0xfe && (ip[1]&0xc0) == 0xc0 {
-			return true, "site-local IPv6 address"
-		}
-		// Unique local address (ULA): fc00::/7 (already covered by IsPrivate for Go 1.17+)
-		if (ip[0] & 0xfe) == 0xfc {
-			return true, "unique local IPv6 address"
-		}
-		// IPv4-mapped IPv6 addresses: ::ffff:x.x.x.x
-		if isZeros(ip[0:10]) && ip[10] == 0xff && ip[11] == 0xff {
-			mappedIP := ip[12:16]
-			if restricted, reason := isRestrictedIP(net.IP(mappedIP)); restricted {
-				return true, fmt.Sprintf("IPv4-mapped %s", reason)
-			}
-		}
-		// Teredo tunneling addresses: 2001:0000::/32
-		// Embed arbitrary IPv4 in the payload; can reach internal hosts via relay.
-		if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 {
-			return true, "Teredo tunneling address"
-		}
-		// 6to4 addresses: 2002::/16
-		// Bits 16-47 carry an IPv4 address; block when embedded IPv4 is restricted.
-		if ip[0] == 0x20 && ip[1] == 0x02 {
-			embeddedIP := net.IP(ip[2:6])
-			if restricted, reason := isRestrictedIP(embeddedIP); restricted {
-				return true, fmt.Sprintf("6to4 embedded %s", reason)
-			}
-		}
-	}
-
-	return false, ""
+	return true, reason
 }
 
 // IsPublicIP returns true if the IP is safe for outbound fetch (not private, loopback, link-local, etc.).
@@ -331,16 +266,6 @@ func isRestrictedIP(ip net.IP) (bool, string) {
 func IsPublicIP(ip net.IP) bool {
 	restricted, _ := isRestrictedIP(ip)
 	return !restricted
-}
-
-// isZeros checks if a byte slice is all zeros
-func isZeros(b []byte) bool {
-	for _, v := range b {
-		if v != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 // ipLikePatterns contains regex patterns for detecting IP-like hostnames
@@ -459,27 +384,8 @@ func isSSRFSafeURL(rawURL string) (bool, string) {
 
 	// Check for suspicious port numbers
 	port := parsed.Port()
-	if port != "" {
-		// Block common internal service ports
-		blockedPorts := map[string]bool{
-			"22":    true, // SSH
-			"23":    true, // Telnet
-			"25":    true, // SMTP
-			"445":   true, // SMB
-			"3389":  true, // RDP
-			"5432":  true, // PostgreSQL
-			"3306":  true, // MySQL
-			"6379":  true, // Redis
-			"27017": true, // MongoDB
-			"9200":  true, // Elasticsearch
-			"2379":  true, // etcd
-			"2380":  true, // etcd
-			"8500":  true, // Consul
-			"4001":  true, // etcd (old)
-		}
-		if blockedPorts[port] {
-			return false, fmt.Sprintf("port %s is blocked for security reasons", port)
-		}
+	if restrictedPorts[port] {
+		return false, fmt.Sprintf("port %s is blocked for security reasons", port)
 	}
 
 	return true, ""
@@ -818,13 +724,34 @@ func newSSRFCheckRedirect(maxRedirects int) func(*http.Request, []*http.Request)
 		if redirectHost != "" && IsSSRFWhitelisted(redirectHost) {
 			return nil
 		}
-		redirectURL := req.URL.String()
-		if safe, reason := isSSRFSafeURL(redirectURL); !safe {
-			return fmt.Errorf("%w: %s", ErrSSRFRedirectBlocked, reason)
+		if err := validateURLForSSRFForOutbound(req.URL.String()); err != nil {
+			return fmt.Errorf("%w: %w", ErrSSRFRedirectBlocked, err)
 		}
 
 		return nil
 	}
+}
+
+// SSRFValidatingRoundTripper enforces the URL policy for every outbound
+// request, including URLs discovered at runtime by SDKs (for example OAuth
+// metadata) that never passed through an application handler. Dial-time checks
+// remain necessary to pin DNS answers and cover transports that cannot accept
+// this wrapper directly.
+type SSRFValidatingRoundTripper struct {
+	Base http.RoundTripper
+}
+
+func (t *SSRFValidatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil {
+		return nil, fmt.Errorf("outbound request blocked: request URL is required")
+	}
+	if t == nil || t.Base == nil {
+		return nil, fmt.Errorf("outbound request blocked: base transport is required")
+	}
+	if err := validateURLForSSRFForOutbound(req.URL.String()); err != nil {
+		return nil, fmt.Errorf("outbound request blocked by SSRF policy: %w", err)
+	}
+	return t.Base.RoundTrip(req)
 }
 
 // NewSSRFSafeHTTPClientWithTransport wraps a caller-supplied transport in an
@@ -834,9 +761,12 @@ func newSSRFCheckRedirect(maxRedirects int) func(*http.Request, []*http.Request)
 func NewSSRFSafeHTTPClientWithTransport(
 	config SSRFSafeHTTPClientConfig, transport http.RoundTripper,
 ) *http.Client {
+	if transport == nil {
+		transport = NewSSRFSafeTransport(config)
+	}
 	return &http.Client{
 		Timeout:       config.Timeout,
-		Transport:     transport,
+		Transport:     &SSRFValidatingRoundTripper{Base: transport},
 		CheckRedirect: newSSRFCheckRedirect(config.MaxRedirects),
 	}
 }
@@ -849,12 +779,18 @@ func NewSSRFSafeHTTPClient(config SSRFSafeHTTPClientConfig) *http.Client {
 	return NewSSRFSafeHTTPClientWithTransport(config, NewSSRFSafeTransport(config))
 }
 
+// SSRFSafeGRPCDialer is compatible with grpc.WithContextDialer and pins DNS
+// answers the same way as SSRFSafeDialContext.
+func SSRFSafeGRPCDialer(ctx context.Context, addr string) (net.Conn, error) {
+	return SSRFSafeDialContext(ctx, "tcp", addr)
+}
+
 // SSRFSafeDialContext is a custom dial function that validates the resolved IP addresses
 // before establishing a connection. This provides an additional layer of SSRF protection
 // against DNS rebinding attacks during the connection phase.
 func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	// Parse host and port
-	host, _, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid address %s: %w", addr, err)
 	}
@@ -870,6 +806,9 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		}
 		return dialer.DialContext(ctx, network, addr)
 	}
+	if restrictedPorts[port] {
+		return nil, fmt.Errorf("connection blocked: port %s is restricted", port)
+	}
 
 	// Check if the host is a restricted hostname
 	hostLower := strings.ToLower(host)
@@ -884,10 +823,16 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		}
 	}
 
-	// Resolve the hostname to IP addresses
+	// Resolve the hostname once, validate every answer, and then dial one of
+	// those exact IPs. Dialing the original hostname here would make the
+	// standard dialer resolve it a second time, leaving a DNS-rebinding window
+	// between validation and connection establishment.
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("DNS resolution returned no addresses for %s", host)
 	}
 
 	// Validate all resolved IPs
@@ -897,13 +842,22 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		}
 	}
 
-	// If we get here, all IPs are safe. Connect using the standard dialer.
-	// We dial the original address so that proper connection routing happens.
+	// If we get here, all IPs are safe. Pin the connection to the validated DNS
+	// answers; TLS still uses the request hostname for SNI/certificate checks.
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	return dialer.DialContext(ctx, network, addr)
+	var lastErr error
+	for _, ipAddr := range ips {
+		pinnedAddr := net.JoinHostPort(ipAddr.IP.String(), port)
+		conn, dialErr := dialer.DialContext(ctx, network, pinnedAddr)
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	return nil, fmt.Errorf("failed to connect to validated addresses for %s: %w", host, lastErr)
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +941,7 @@ func loadSSRFWhitelist() *ssrfWhitelistConfig {
 // applySSRFWhitelist for the canonical merge logic.
 func SetSSRFWhitelistFromRaw(raw string) {
 	ssrfWhitelistAtomic.Store(parseSSRFWhitelistRaw(raw))
+	invalidateSSRFOutboundValidationCache()
 }
 
 // parseSSRFWhitelistRaw parses a comma-separated whitelist string into
@@ -1165,6 +1120,7 @@ func ResetSSRFWhitelistForTest() {
 	ssrfWhitelistOnce = sync.Once{}
 	ssrfWhitelist = nil
 	ssrfWhitelistAtomic.Store(nil)
+	invalidateSSRFOutboundValidationCache()
 }
 
 // FormatSSRFError takes the error returned by ValidateURLForSSRF and wraps
@@ -1240,6 +1196,13 @@ func ValidateURLForSSRF(rawURL string) error {
 	hostname := parsed.Hostname()
 	if hostname == "" {
 		return fmt.Errorf("URL has no hostname")
+	}
+
+	// A whitelist relaxes host/IP restrictions only. It must never turn other
+	// schemes (file://, gopher://, etc.) into valid outbound request targets.
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("invalid scheme: %s (only http/https allowed)", scheme)
 	}
 
 	// If the host is whitelisted, skip the heavy checks.

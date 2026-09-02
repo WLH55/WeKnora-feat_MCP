@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	"github.com/Tencent/WeKnora/internal/common"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/chunker"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -49,6 +50,7 @@ func (s *knowledgeService) cloneKnowledge(
 		EnableStatus:     "disabled",
 		EmbeddingModelID: targetKB.EmbeddingModelID,
 		FileName:         src.FileName,
+		FolderPath:       src.FolderPath,
 		FileType:         src.FileType,
 		FileSize:         src.FileSize,
 		FileHash:         src.FileHash,
@@ -219,24 +221,14 @@ func buildSplitterConfig(kb *types.KnowledgeBase) chunker.SplitterConfig {
 }
 
 func buildSplitterConfigFromChunking(cc types.ChunkingConfig) chunker.SplitterConfig {
-	chunkCfg := chunker.SplitterConfig{
+	return chunker.NormalizeSplitterConfig(chunker.SplitterConfig{
 		ChunkSize:    cc.ChunkSize,
 		ChunkOverlap: cc.ChunkOverlap,
 		Separators:   cc.Separators,
 		Strategy:     cc.Strategy,
 		TokenLimit:   cc.TokenLimit,
 		Languages:    cc.Languages,
-	}
-	if chunkCfg.ChunkSize <= 0 {
-		chunkCfg.ChunkSize = chunker.DefaultChunkSize
-	}
-	if chunkCfg.ChunkOverlap <= 0 {
-		chunkCfg.ChunkOverlap = chunker.DefaultChunkOverlap
-	}
-	if len(chunkCfg.Separators) == 0 {
-		chunkCfg.Separators = []string{"\n\n", "\n", "。"}
-	}
-	return chunkCfg
+	})
 }
 
 // buildParentChildConfigs derives parent and child SplitterConfig from ChunkingConfig.
@@ -246,27 +238,7 @@ func buildSplitterConfigFromChunking(cc types.ChunkingConfig) chunker.SplitterCo
 // splitter, so parent-child chunks would silently lose heading alignment and
 // ContextHeader breadcrumbs regardless of the configured strategy.
 func buildParentChildConfigs(cc types.ChunkingConfig, base chunker.SplitterConfig) (parent, child chunker.SplitterConfig) {
-	parentSize := cc.ParentChunkSize
-	if parentSize <= 0 {
-		parentSize = 4096
-	}
-	childSize := cc.ChildChunkSize
-	if childSize <= 0 {
-		childSize = 384
-	}
-	parent = chunker.SplitterConfig{
-		ChunkSize:    parentSize,
-		ChunkOverlap: base.ChunkOverlap, // reuse configured overlap for parents
-		Separators:   base.Separators,
-		Strategy:     base.Strategy,
-	}
-	child = chunker.SplitterConfig{
-		ChunkSize:    childSize,
-		ChunkOverlap: childSize / 5, // ~20% overlap for child chunks
-		Separators:   base.Separators,
-		Strategy:     base.Strategy,
-	}
-	return
+	return chunker.DeriveParentChildConfigs(base, cc.ParentChunkSize, cc.ChildChunkSize)
 }
 
 // processChunks processes chunks and creates embeddings for knowledge content
@@ -278,6 +250,23 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	var options ProcessChunksOptions
 	if len(opts) > 0 {
 		options = opts[0]
+	}
+
+	// Parser output and manually supplied passages can contain malformed byte
+	// sequences. Clean them before logging, chunk persistence, or embedding;
+	// the embedding provider and tracing/database drivers expect valid UTF-8.
+	for i := range chunks {
+		chunks[i].Content = common.CleanInvalidUTF8(chunks[i].Content)
+		chunks[i].ContextHeader = common.CleanInvalidUTF8(chunks[i].ContextHeader)
+		for j := range chunks[i].Images {
+			chunks[i].Images[j].URL = common.CleanInvalidUTF8(chunks[i].Images[j].URL)
+			chunks[i].Images[j].Caption = common.CleanInvalidUTF8(chunks[i].Images[j].Caption)
+			chunks[i].Images[j].OCRText = common.CleanInvalidUTF8(chunks[i].Images[j].OCRText)
+			chunks[i].Images[j].OriginalURL = common.CleanInvalidUTF8(chunks[i].Images[j].OriginalURL)
+		}
+	}
+	for i := range options.ParentChunks {
+		options.ParentChunks[i].Content = common.CleanInvalidUTF8(options.ParentChunks[i].Content)
 	}
 
 	// Check if knowledge is being deleted/cancelled before processing.
@@ -471,14 +460,11 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		return insertChunks[i].ChunkIndex < insertChunks[j].ChunkIndex
 	})
 
-	// 仅为文本类型的Chunk设置前后关系（child chunks only, parents already linked above）
+	// Collect retrievable text chunks only. ParentChunkID only controls parent expansion after retrieval.
+	// When ParentChunkID is empty, retrieval keeps the standalone child content without loading a parent.
 	textChunks := make([]*types.Chunk, 0, len(chunks))
 	for _, chunk := range insertChunks {
-		if chunk.ChunkType == types.ChunkTypeText && chunk.ParentChunkID != "" {
-			// This is a child chunk in parent-child mode
-			textChunks = append(textChunks, chunk)
-		} else if chunk.ChunkType == types.ChunkTypeText && !hasParentChild {
-			// Normal flat chunk (no parent-child mode)
+		if chunk.ChunkType == types.ChunkTypeText {
 			textChunks = append(textChunks, chunk)
 		}
 	}
@@ -680,7 +666,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	} else {
 		s.skipStage(ctx, knowledge.ID, types.StageMultimodal, "skipped")
 		// If there are no multimodal tasks, enqueue the post process task immediately
-		lang, _ := types.LanguageFromContext(ctx)
+		lang := types.LanguageFromContextOrDefault(ctx)
 		postProcessPayload := types.KnowledgePostProcessPayload{
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
@@ -727,7 +713,70 @@ const imageDominatedTextThreshold = 200
 // (typical for scanned PDFs where VLM OCR yielded nothing). Callers should
 // mark the knowledge's summary as failed instead of falling back to the first
 // chunk's raw content (which would just be a bare image reference).
-var errInsufficientSummaryContent = errors.New("insufficient text content for summary generation")
+var (
+	errInsufficientSummaryContent = errors.New("insufficient text content for summary generation")
+	errEmptySummaryOutput         = errors.New("summary model returned empty output")
+)
+
+const summaryFallbackMaxRunes = 500
+
+// validateSummaryOutput rejects successful model responses that contain no
+// user-visible text. Treating whitespace-only output as an error lets Asynq
+// retry the summary task instead of persisting description="" as completed.
+func validateSummaryOutput(response *types.ChatResponse) (string, error) {
+	if response == nil {
+		return "", errEmptySummaryOutput
+	}
+	content := strings.TrimSpace(response.Content)
+	if content == "" {
+		return "", errEmptySummaryOutput
+	}
+	return content, nil
+}
+
+// firstTextChunkSummaryFallback preserves the existing deterministic fallback:
+// use the first already-ordered text chunk and cap it by runes so Chinese and
+// emoji are never cut in the middle of a UTF-8 sequence.
+func firstTextChunkSummaryFallback(textChunks []*types.Chunk) string {
+	if len(textChunks) == 0 || textChunks[0] == nil {
+		return ""
+	}
+	fallback := strings.TrimSpace(textChunks[0].Content)
+	runes := []rune(fallback)
+	if len(runes) > summaryFallbackMaxRunes {
+		fallback = string(runes[:summaryFallbackMaxRunes])
+	}
+	return fallback
+}
+
+// applyRetryableSummaryFailureState keeps an existing description visible
+// while another attempt is queued, then publishes the deterministic fallback
+// and marks only the summary subtask failed after the retry budget is exhausted.
+func applyRetryableSummaryFailureState(
+	knowledge *types.Knowledge, textChunks []*types.Chunk, willRetry bool,
+) string {
+	knowledge.UpdatedAt = time.Now()
+	if willRetry {
+		knowledge.SummaryStatus = types.SummaryStatusPending
+		return ""
+	}
+	fallback := firstTextChunkSummaryFallback(textChunks)
+	knowledge.Description = fallback
+	knowledge.SummaryStatus = types.SummaryStatusFailed
+	return fallback
+}
+
+// summaryTaskWillRetry reports whether the current Asynq delivery has another
+// configured attempt remaining. Calls outside an Asynq worker are terminal.
+func summaryTaskWillRetry(ctx context.Context) bool {
+	retried, retryOK := asynq.GetRetryCount(ctx)
+	maxRetry, maxRetryOK := asynq.GetMaxRetry(ctx)
+	if retryOK && maxRetryOK {
+		return retried < maxRetry
+	}
+	retried, maxRetry, ok := types.TaskRetryMetadataFromContext(ctx)
+	return ok && retried < maxRetry
+}
 
 // checkSufficientSummaryContent returns errInsufficientSummaryContent if the
 // given content does not carry enough real text (after stripping image markup)
@@ -792,10 +841,9 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 	// any chunk has been manually edited; after that ChunkIndex is safer.
 	sortedChunks := sortChunksForSummary(chunks)
 
-	// Concatenate original chunk contents by StartAt offset to reconstruct the
-	// document, then enrich with image info in a second pass. Enrichment must
-	// happen AFTER concatenation because StartAt is based on original document
-	// offsets — enriched (longer) content would break the positioning.
+	// Reconstruct the document before enriching it with image info. Enrichment
+	// must happen AFTER reconstruction because StartAt is based on original
+	// document offsets; enriched (longer) content would break the positioning.
 	chunkContents := ""
 	hasEditedChunk := false
 	for _, chunk := range sortedChunks {
@@ -816,14 +864,9 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		}
 		chunkContents = strings.Join(parts, "\n\n")
 	} else {
-		for _, chunk := range sortedChunks {
-			runes := []rune(chunkContents)
-			if chunk.StartAt <= len(runes) {
-				chunkContents = string(runes[:chunk.StartAt]) + chunk.Content
-			} else {
-				chunkContents += chunk.Content
-			}
-		}
+		// Synthetic table headers are not represented in StartAt/EndAt. Match
+		// real text overlap instead of slicing by source offsets.
+		chunkContents = searchutil.MergeTextChunks(sortedChunks, "")
 	}
 
 	// Collect image_info from image_ocr/image_caption children and enrich
@@ -906,8 +949,13 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		logger.GetLogger(ctx).WithField("error", err).Errorf("GetSummary failed")
 		return "", err
 	}
-	logger.GetLogger(ctx).WithField("summary", summary.Content).Infof("GetSummary success")
-	return summary.Content, nil
+	content, err := validateSummaryOutput(summary)
+	if err != nil {
+		logger.GetLogger(ctx).WithField("error", err).Warnf("GetSummary returned no usable content")
+		return "", err
+	}
+	logger.GetLogger(ctx).WithField("summary", content).Infof("GetSummary success")
+	return content, nil
 }
 
 // sampleLongContent returns content that fits within maxChars.
@@ -990,7 +1038,10 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 				return nil
 			}
 			logger.Warnf(ctx, "Summary refresh failed for knowledge %s: %v", payload.KnowledgeID, err)
-			_ = s.repo.UpdateKnowledgeColumn(ctx, payload.KnowledgeID, "summary_status", types.SummaryStatusFailed)
+			if errors.Is(err, errInsufficientSummaryContent) {
+				return nil
+			}
+			return err
 		}
 		return nil
 	}
@@ -1102,8 +1153,8 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 
 	if len(textChunks) == 0 {
 		logger.Infof(ctx, "No text chunks found for knowledge: %s", payload.KnowledgeID)
-		// Mark as completed since there's nothing to summarize
-		knowledge.SummaryStatus = types.SummaryStatusCompleted
+		knowledge.Description = ""
+		knowledge.SummaryStatus = types.SummaryStatusFailed
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		summaryOut["skipped"] = "no_text_chunks"
@@ -1115,17 +1166,64 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		return textChunks[i].ChunkIndex < textChunks[j].ChunkIndex
 	})
 
-	// Initialize chat model for summary
+	summaryMetadataVersion := string(knowledge.CustomMetadata)
+	handleRetryableSummaryFailure := func(generationErr error) error {
+		summaryErr = generationErr
+		summaryOut["error"] = previewText(generationErr.Error(), 500)
+		summaryOut["error_type"] = fmt.Sprintf("%T", generationErr)
+
+		if summaryTaskWillRetry(ctx) {
+			applyRetryableSummaryFailureState(knowledge, textChunks, true)
+			if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
+				logger.Warnf(ctx, "Failed to mark summary pending for retry: %v", updateErr)
+			}
+			summaryOut["retrying"] = true
+			return fmt.Errorf("summary generation attempt failed: %w", generationErr)
+		}
+
+		// Before publishing the terminal fallback, make sure its source still
+		// matches the chunks and metadata captured for this attempt.
+		stale, staleErr := summarySourceChanged(
+			ctx, s.repo, s.chunkRepo, payload.TenantID, payload.KnowledgeID,
+			summaryMetadataVersion, textChunks,
+		)
+		if staleErr != nil {
+			logger.Errorf(ctx, "Failed to verify summary fallback freshness for knowledge %s: %v",
+				payload.KnowledgeID, staleErr)
+			markSummaryFailed()
+			summaryErr = staleErr
+			return fmt.Errorf("verify summary fallback freshness: %w", staleErr)
+		}
+		if stale {
+			logger.Infof(ctx, "Discarding stale summary fallback for knowledge %s", payload.KnowledgeID)
+			summaryOut["skipped"] = "content_revision_changed"
+			return nil
+		}
+
+		fallback := applyRetryableSummaryFailureState(knowledge, textChunks, false)
+		if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
+			logger.Errorf(ctx, "Failed to save terminal summary fallback: %v", updateErr)
+			summaryErr = updateErr
+			return fmt.Errorf("save terminal summary fallback: %w", updateErr)
+		}
+		if fallback == "" {
+			summaryOut["fallback"] = "empty"
+		} else {
+			summaryOut["fallback"] = "first_chunk"
+		}
+		summaryOut["fallback_chars"] = len([]rune(fallback))
+		return fmt.Errorf("summary generation exhausted retries: %w", generationErr)
+	}
+
+	// Initialize chat model for summary. Model resolution failures use the same
+	// retry budget and terminal first-chunk fallback as LLM request failures.
 	chatModel, err := s.modelService.GetChatModel(ctx, kb.SummaryModelID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get chat model: %v", err)
-		markSummaryFailed()
-		summaryErr = err
-		return fmt.Errorf("failed to get chat model: %w", err)
+		return handleRetryableSummaryFailure(fmt.Errorf("get chat model: %w", err))
 	}
 
 	// Generate summary
-	summaryMetadataVersion := string(knowledge.CustomMetadata)
 	summary, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to generate summary for knowledge %s: %v", payload.KnowledgeID, err)
@@ -1153,17 +1251,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			summaryErr = err
 			return nil
 		}
-		// For other errors (LLM API issues etc.), fall back to the first chunk.
-		if len(textChunks) > 0 {
-			summary = textChunks[0].Content
-			if len(summary) > 500 {
-				runes := []rune(summary)
-				if len(runes) > 500 {
-					summary = string(runes[:500])
-				}
-			}
-			summaryOut["fallback"] = "first_chunk"
-		}
+		return handleRetryableSummaryFailure(err)
 	}
 	// Do not publish an answer derived from a superseded chunk or metadata
 	// version. A user can explicitly refresh again from the latest revision.
@@ -2192,22 +2280,66 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 		}
 	}
 	if len(textChunks) == 0 {
-		return nil, fmt.Errorf("no enabled text chunks to summarize")
+		knowledge.Description = ""
+		knowledge.SummaryStatus = types.SummaryStatusFailed
+		knowledge.UpdatedAt = time.Now()
+		if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
+			return knowledge, updateErr
+		}
+		return knowledge, errInsufficientSummaryContent
 	}
-	chatModel, err := s.modelService.GetChatModel(ctx, kb.SummaryModelID)
-	if err != nil {
-		return nil, err
-	}
+	sort.Slice(textChunks, func(i, j int) bool {
+		return textChunks[i].ChunkIndex < textChunks[j].ChunkIndex
+	})
 	metadataVersion := string(knowledge.CustomMetadata)
 	knowledge.SummaryStatus = types.SummaryStatusProcessing
 	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
 		return nil, err
 	}
+	handleGenerationFailure := func(generationErr error) (*types.Knowledge, error) {
+		if errors.Is(generationErr, errInsufficientSummaryContent) {
+			knowledge.Description = ""
+			knowledge.SummaryStatus = types.SummaryStatusFailed
+			knowledge.UpdatedAt = time.Now()
+			if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
+				return knowledge, updateErr
+			}
+			return knowledge, generationErr
+		}
+		if summaryTaskWillRetry(ctx) {
+			applyRetryableSummaryFailureState(knowledge, textChunks, true)
+			if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
+				logger.Warnf(ctx, "Failed to mark summary refresh pending for retry: %v", updateErr)
+			}
+			return knowledge, generationErr
+		}
+
+		stale, staleErr := summarySourceChanged(
+			ctx, s.repo, s.chunkRepo, tenantID, knowledgeID, metadataVersion, textChunks,
+		)
+		if staleErr != nil {
+			knowledge.SummaryStatus = types.SummaryStatusFailed
+			_ = s.repo.UpdateKnowledge(ctx, knowledge)
+			return knowledge, fmt.Errorf("verify summary fallback freshness: %w", staleErr)
+		}
+		if stale {
+			return knowledge, ErrSummaryRefreshStale
+		}
+
+		applyRetryableSummaryFailureState(knowledge, textChunks, false)
+		if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
+			return knowledge, updateErr
+		}
+		return knowledge, generationErr
+	}
+
+	chatModel, err := s.modelService.GetChatModel(ctx, kb.SummaryModelID)
+	if err != nil {
+		return handleGenerationFailure(fmt.Errorf("get chat model: %w", err))
+	}
 	summary, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
 	if err != nil {
-		knowledge.SummaryStatus = types.SummaryStatusFailed
-		_ = s.repo.UpdateKnowledge(ctx, knowledge)
-		return nil, err
+		return handleGenerationFailure(err)
 	}
 	stale, err := summarySourceChanged(
 		ctx, s.repo, s.chunkRepo, tenantID, knowledgeID, metadataVersion, textChunks,
@@ -2226,26 +2358,35 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 		return nil, err
 	}
 	if kb.NeedsEmbeddingModel() {
-		found := false
 		maxIndex := 0
-		summaryChunks := make([]*types.Chunk, 0, 1)
 		for _, chunk := range allChunks {
 			if chunk.ChunkIndex > maxIndex {
 				maxIndex = chunk.ChunkIndex
 			}
-			if chunk.ChunkType == types.ChunkTypeSummary {
-				chunk.Content = "# Summary\n" + summary
-				chunk.SourceContent = chunk.Content
-				chunk.IsEnabled = true
-				chunk.UpdatedAt = time.Now()
-				if err := s.chunkRepo.UpdateChunk(ctx, chunk); err != nil {
-					return nil, err
-				}
-				summaryChunks = append(summaryChunks, chunk)
-				found = true
-			}
 		}
-		if !found {
+		// allChunks holds text chunks only, so it can never carry the existing
+		// summary chunk. Scanning it for one always came up empty, which left
+		// every refresh appending a new summary chunk beside the stale one --
+		// and a stale summary stays enabled and indexed, so content the user
+		// edited out of the document kept being retrievable through it.
+		existingSummaries, err := s.chunkRepo.ListChunksByKnowledgeIDAndTypes(
+			ctx, tenantID, knowledgeID, []types.ChunkType{types.ChunkTypeSummary},
+		)
+		if err != nil {
+			return nil, err
+		}
+		summaryChunks := make([]*types.Chunk, 0, len(existingSummaries))
+		for _, chunk := range existingSummaries {
+			chunk.Content = "# Summary\n" + summary
+			chunk.SourceContent = chunk.Content
+			chunk.IsEnabled = true
+			chunk.UpdatedAt = time.Now()
+			if err := s.chunkRepo.UpdateChunk(ctx, chunk); err != nil {
+				return nil, err
+			}
+			summaryChunks = append(summaryChunks, chunk)
+		}
+		if len(summaryChunks) == 0 {
 			summaryChunk := &types.Chunk{
 				ID: uuid.NewString(), TenantID: tenantID, KnowledgeID: knowledge.ID,
 				KnowledgeBaseID: knowledge.KnowledgeBaseID, Content: "# Summary\n" + summary,
@@ -2400,7 +2541,7 @@ func (s *knowledgeService) ReparseKnowledge(
 			questionCount = 3
 		}
 
-		lang, _ := types.LanguageFromContext(ctx)
+		lang := types.LanguageFromContextOrDefault(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2454,7 +2595,7 @@ func (s *knowledgeService) ReparseKnowledge(
 			questionCount = 3
 		}
 
-		lang, _ := types.LanguageFromContext(ctx)
+		lang := types.LanguageFromContextOrDefault(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2507,7 +2648,7 @@ func (s *knowledgeService) ReparseKnowledge(
 			questionCount = 3
 		}
 
-		lang, _ := types.LanguageFromContext(ctx)
+		lang := types.LanguageFromContextOrDefault(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2773,6 +2914,7 @@ func (s *knowledgeService) UpdateImageInfo(
 	chunkID string,
 	imageInfo string,
 ) error {
+	imageInfo = common.CleanInvalidUTF8(imageInfo)
 	var images []*types.ImageInfo
 	if err := json.Unmarshal([]byte(imageInfo), &images); err != nil {
 		logger.Errorf(ctx, "Failed to unmarshal image info: %v", err)
@@ -2859,6 +3001,10 @@ func (s *knowledgeService) UpdateImageInfo(
 			ChunkType:       types.ChunkTypeImageCaption,
 			ParentChunkID:   chunk.ID,
 			ImageInfo:       imageInfo,
+			// CreateChunks inserts with Select("*"), so the gorm default:true never
+			// applies -- an unset IsEnabled lands in the database as false and the
+			// chunk is silently excluded from retrieval and model context.
+			IsEnabled: true,
 		}
 		addChunk = append(addChunk, captionChunk)
 		logger.Infof(ctx, "Created new caption chunk ID: %s for image URL: %s", captionChunk.ID, image.OriginalURL)
@@ -2875,6 +3021,7 @@ func (s *knowledgeService) UpdateImageInfo(
 			ChunkType:       types.ChunkTypeImageOCR,
 			ParentChunkID:   chunk.ID,
 			ImageInfo:       imageInfo,
+			IsEnabled:       true,
 		}
 		addChunk = append(addChunk, ocrChunk)
 		logger.Infof(ctx, "Created new OCR chunk ID: %s for image URL: %s", ocrChunk.ID, image.OriginalURL)
@@ -3385,7 +3532,11 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		logger.Infof(ctx, "Resolved %d total images for knowledge %s", len(storedImages), knowledge.ID)
 	}
 
-	// Step 3: Split into chunks using Go chunker
+	// Step 3: Split into chunks using Go chunker. Browser textareas normalize
+	// pasted content to LF, so normalize uploaded source text before calculating
+	// chunk boundaries as well.
+	sanitizeReadResult(convertResult)
+	convertResult.MarkdownContent = chunker.NormalizeLineEndings(convertResult.MarkdownContent)
 	chunkCfg := buildSplitterConfigFromChunking(eff.ChunkingConfig)
 
 	processOpts := ProcessChunksOptions{
@@ -3441,6 +3592,28 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 	return nil
 }
 
+// sanitizeReadResult protects every text field that can cross from a parser
+// into the embedding, storage, or tracing layers. A parser may return a Go
+// string containing arbitrary bytes even though the string type itself does
+// not enforce UTF-8 validity.
+func sanitizeReadResult(result *types.ReadResult) {
+	if result == nil {
+		return
+	}
+	result.MarkdownContent = common.CleanInvalidUTF8(result.MarkdownContent)
+	result.ImageDirPath = common.CleanInvalidUTF8(result.ImageDirPath)
+	result.Error = common.CleanInvalidUTF8(result.Error)
+	for key, value := range result.Metadata {
+		result.Metadata[key] = common.CleanInvalidUTF8(value)
+	}
+	for i := range result.ImageRefs {
+		result.ImageRefs[i].Filename = common.CleanInvalidUTF8(result.ImageRefs[i].Filename)
+		result.ImageRefs[i].OriginalRef = common.CleanInvalidUTF8(result.ImageRefs[i].OriginalRef)
+		result.ImageRefs[i].MimeType = common.CleanInvalidUTF8(result.ImageRefs[i].MimeType)
+		result.ImageRefs[i].StorageKey = common.CleanInvalidUTF8(result.ImageRefs[i].StorageKey)
+	}
+}
+
 // convert handles both file and URL reading using a unified ReadRequest.
 func (s *knowledgeService) convert(
 	ctx context.Context,
@@ -3473,6 +3646,16 @@ func (s *knowledgeService) convert(
 	}
 	mergedOverrides := MergeParserEngineOverrides(tenantOverrides, uploadOverrides)
 	applyParserRuleOverrides(mergedOverrides, eff.ChunkingConfig, fileType)
+	if err := validateParserEngineOverrideURLs(mergedOverrides); err != nil {
+		logger.Errorf(ctx, "Parser endpoint rejected for SSRF protection: %v", err)
+		knowledge.ParseStatus = "failed"
+		knowledge.ErrorMessage = "Parser endpoint is not allowed for security reasons"
+		knowledge.UpdatedAt = time.Now()
+		s.repo.UpdateKnowledge(ctx, knowledge)
+		s.failStage(ctx, knowledge.ID, types.StageDocReader,
+			werrors.ErrCodeDocReaderParseFailed, knowledge.ErrorMessage, err)
+		return nil, nil
+	}
 
 	if isURL {
 		if err := secutils.ValidateURLForSSRF(payload.URL); err != nil {
@@ -3548,6 +3731,7 @@ func (s *knowledgeService) convert(
 			code, "document read failed", err)
 		return s.failKnowledge(ctx, knowledge, isLastRetry, "document read failed: %v", err)
 	}
+	sanitizeReadResult(result)
 	if result.Error != "" {
 		logger.Errorf(ctx, "[convert] parser returned error kb=%s knowledge=%s file=%q type=%s engine=%q: %s",
 			kb.ID, knowledge.ID, req.FileName, fileType, parserEngine, result.Error)
@@ -3625,41 +3809,23 @@ func isLikelyRateLimitError(err error) bool {
 	return false
 }
 
-// Returns nil when the required service is unavailable.
-func (s *knowledgeService) resolveDocReader(ctx context.Context, engine, fileType string, isURL bool, overrides map[string]string) interfaces.DocReader {
-	switch engine {
-	case docparser.SimpleEngineName:
-		return &docparser.SimpleFormatReader{}
-	case docparser.WeKnoraCloudEngineName:
-		creds := s.tenantService.GetWeKnoraCloudCredentials(ctx)
-		if creds == nil {
-			logger.Warnf(ctx, "[resolveDocReader] WeKnoraCloud: no tenant credentials (fileType=%s)", fileType)
-			return nil
-		}
-		reader, err := docparser.NewWeKnoraCloudSignedDocumentReader(creds.AppID, creds.AppSecret)
-		if err != nil {
-			logger.Errorf(ctx, "[resolveDocReader] WeKnoraCloud reader init failed: %v", err)
-			return nil
-		}
-		return reader
-	case "mineru":
-		return docparser.NewMinerUReader(overrides)
-	case "mineru_cloud":
-		return docparser.NewMinerUCloudReader(overrides)
-	case "paddleocr_vl":
-		return docparser.NewPaddleOCRVLReader(overrides)
-	case "paddleocr_vl_cloud":
-		return docparser.NewPaddleOCRVLCloudReader(overrides)
-	case "builtin":
-		// 明确指定使用 builtin 引擎（docreader），不使用 simple format 兜底
-		return s.documentReader
-	default:
-		// 未指定引擎时的兜底逻辑：simple format 使用 Go 原生处理，其他使用 docreader
-		if !isURL && docparser.IsSimpleFormat(fileType) {
-			return &docparser.SimpleFormatReader{}
-		}
-		return s.documentReader
+// resolveDocReader picks the reader for one parse request. The engine catalog
+// itself lives in the docparser registry; this only supplies the dependencies
+// the service owns. Returns nil when the chosen engine cannot run — an
+// unconfigured cloud engine, a disconnected docreader — after logging why.
+func (s *knowledgeService) resolveDocReader(
+	ctx context.Context, engine, fileType string, isURL bool, overrides map[string]string,
+) interfaces.DocReader {
+	reader, err := docparser.NewReader(ctx, engine, fileType, isURL, docparser.ReaderDeps{
+		Overrides:               overrides,
+		Remote:                  s.documentReader,
+		WeKnoraCloudCredentials: s.tenantService.GetWeKnoraCloudCredentials,
+	})
+	if err != nil {
+		logger.Warnf(ctx, "[resolveDocReader] engine=%q fileType=%q unusable: %v", engine, fileType, err)
+		return nil
 	}
+	return reader
 }
 
 // failKnowledge marks knowledge as failed (only on last retry) and returns an error.
@@ -3715,7 +3881,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			chunkID = chunks[0].ChunkID
 		}
 
-		lang, _ := types.LanguageFromContext(ctx)
+		lang := types.LanguageFromContextOrDefault(ctx)
 		payload := types.ImageMultimodalPayload{
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,

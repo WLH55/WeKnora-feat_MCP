@@ -161,6 +161,38 @@ def _is_restricted_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -
             if isinstance(net, ipaddress.IPv4Network) and ip in net:
                 return f"restricted range {net}"
     if isinstance(ip, ipaddress.IPv6Address):
+        embedded_ipv4 = ip.ipv4_mapped
+        if embedded_ipv4 is not None:
+            reason = _is_restricted_ip(embedded_ipv4)
+            if reason:
+                return f"IPv4-mapped {reason}"
+        if ip.sixtofour is not None:
+            reason = _is_restricted_ip(ip.sixtofour)
+            if reason:
+                return f"6to4-embedded {reason}"
+        if ip.teredo is not None:
+            server_ip, client_ip = ip.teredo
+            for label, embedded_ip in (("server", server_ip), ("client", client_ip)):
+                reason = _is_restricted_ip(embedded_ip)
+                if reason:
+                    return f"Teredo {label} embeds {reason}"
+        # NAT64's well-known prefix (64:ff9b::/96, RFC 6052) and the deprecated
+        # IPv4-compatible form (::a.b.c.d) also carry a plain IPv4 address, but
+        # ipaddress exposes no accessor for either, so is_private and
+        # .sixtofour never see the payload. Without these two branches
+        # ::169.254.169.254 reads as an ordinary public IPv6 address.
+        # Mirrors internal/ipclass on the Go side.
+        packed = ip.packed
+        if packed[0:4] == b"\x00\x64\xff\x9b" and packed[4:12] == bytes(8):
+            reason = _is_restricted_ip(ipaddress.IPv4Address(packed[12:16]))
+            if reason:
+                return f"NAT64-embedded {reason}"
+        if packed[0:12] == bytes(12):
+            # :: and ::1 already returned above; ::ffff:a.b.c.d is handled by
+            # the ipv4_mapped branch.
+            reason = _is_restricted_ip(ipaddress.IPv4Address(packed[12:16]))
+            if reason:
+                return f"IPv4-compatible {reason}"
         # Site-local (fec0::/10)
         if (ip.packed[0] == 0xFE) and (ip.packed[1] & 0xC0) == 0xC0:
             return "site-local IPv6 address"
@@ -238,7 +270,10 @@ def is_ssrf_safe_url(raw_url: str) -> Tuple[bool, str]:
                 f"hostname {hostname_lower} resolves to restricted IP {resolved_ip}: {reason}",
             )
 
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        return False, f"invalid port: {exc}"
     if port is not None and str(port) in BLOCKED_PORTS:
         return False, f"port {port} is blocked for security reasons"
 

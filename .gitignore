@@ -1,3 +1,4 @@
+
 # 忽略所有隐藏文件和目录
 .*
 # 但不忽略特定隐藏文件和目录
@@ -72,3 +73,5 @@ miniprogram/project.private.config.json
 
 # 本地工具配置
 reasonix.toml
+# Staging dir for the Docker sandbox self-check probe (removed after each run)
+.weknora-sandbox-check-*

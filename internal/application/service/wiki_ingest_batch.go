@@ -496,7 +496,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 						RetractDocContent: op.DocSummary,
 						DocTitle:          op.DocTitle,
 						KnowledgeID:       op.KnowledgeID,
-						Language:          types.LanguageLocaleName(op.Language),
+						Language:          types.ResolveLanguageName(ctx, op.Language),
 					})
 				}
 				for folderID := range folderSet {
@@ -561,6 +561,11 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		})
 	}
 	_ = eg.Wait()
+
+	// Re-read identity claims after every map worker has chosen a slug so
+	// concurrent romanizations of the same title collapse before taxonomy
+	// planning and Reduce lock by slug.
+	slugUpdates = s.remapSlugUpdatesByIdentity(ctx, payload.KnowledgeBaseID, slugUpdates, batchCtx)
 
 	// Plan the directory once for the whole batch BEFORE reduce. Reduce writes
 	// pages in parallel, so it can't converge on shared folders on its own; this
@@ -1157,7 +1162,7 @@ func (s *wikiIngestService) mapOneDocument(
 ) (*docIngestResult, []SlugUpdate, error) {
 	docStartedAt := time.Now()
 	knowledgeID := op.KnowledgeID
-	lang := types.LanguageLocaleName(op.Language)
+	lang := types.ResolveLanguageName(ctx, op.Language)
 
 	// Open a postprocess.wiki subspan under the parent attempt's
 	// postprocess stage so the actual per-doc work (LLM extraction +
@@ -1364,6 +1369,9 @@ func (s *wikiIngestService) mapOneDocument(
 	// citations simply keep their Description+Details fallback).
 	var uncited int
 	extractedEntities, extractedConcepts, uncited = mergeCitationsIntoItems(extractedEntities, extractedConcepts, citations, newSlugs)
+	extractedEntities, extractedConcepts = s.reclaimExtractedIdentities(
+		ctx, payload.KnowledgeBaseID, extractedEntities, extractedConcepts, batchCtx,
+	)
 
 	// Rebuild slugItems so stale entries (for slugs that did not survive the
 	// merge) and brand-new slugs discovered by the citation pass are both
@@ -1644,7 +1652,7 @@ func (s *wikiIngestService) extractEntitiesAndConceptsNoUpsert(
 	// safe default — the LLM merge call simply doesn't get a candidate
 	// list and the items pass through unchanged.
 	result.Entities, result.Concepts = s.deduplicateExtractedBatch(
-		ctx, chatModel, kbID, result.Entities, result.Concepts,
+		ctx, chatModel, kbID, result.Entities, result.Concepts, batchCtx,
 	)
 
 	slugItems := make(map[string]extractedItem)
@@ -1660,6 +1668,26 @@ func (s *wikiIngestService) extractEntitiesAndConceptsNoUpsert(
 	}
 
 	return result.Entities, result.Concepts, slugItems, nil
+}
+
+// resolveSlugUpdateLanguage picks the language the editor prompt should write
+// the page in.
+//
+// A single page aggregates updates from every document that cites it, and an
+// update queued before the language field existed — or enqueued from a
+// background path that never saw the HTTP language middleware — carries none.
+// Scanning for the first update that resolved a language, rather than indexing
+// into one bucket, keeps the page localised as long as ANY contributor knew the
+// language; the deployment default covers the case where none did. Without the
+// fallback the prompt renders "Write in ." and the model picks a language at
+// random, which is how single pages ended up in the wrong language.
+func resolveSlugUpdateLanguage(ctx context.Context, updates []SlugUpdate) string {
+	for _, u := range updates {
+		if u.Language != "" {
+			return u.Language
+		}
+	}
+	return types.LanguageNameFromContext(ctx)
 }
 
 // reduceSlugUpdates returns:
@@ -1837,11 +1865,10 @@ func (s *wikiIngestService) reduceSlugUpdates(
 	var newContentBuilder strings.Builder
 	var sharedSourceContexts strings.Builder
 	var docTitles []string
-	var language string
+
+	language := resolveSlugUpdateLanguage(ctx, updates)
 
 	if len(retracts) > 0 {
-		language = retracts[0].Language
-
 		for _, r := range retracts {
 			fmt.Fprintf(&deletedContent, "<document>\n<title>%s</title>\n<content>\n%s\n</content>\n</document>\n\n", r.DocTitle, r.RetractDocContent)
 		}
@@ -1891,8 +1918,6 @@ func (s *wikiIngestService) reduceSlugUpdates(
 	}
 
 	if len(additions) > 0 {
-		language = additions[0].Language
-
 		// Resolve SourceChunks → chunk contents in a single batched query per
 		// knowledge ID, so the <new_information> block can quote the chunks
 		// verbatim instead of relying on the short Details paraphrase.

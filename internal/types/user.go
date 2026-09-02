@@ -25,11 +25,14 @@ type UserPreferences struct {
 	// LastActiveTenantID remembers the last workspace the user actively
 	// switched into, so a fresh login (new device, cleared browser, new
 	// refresh token) lands them back in that workspace instead of always
-	// bouncing to their home workspace. Login / RefreshToken validate that
+	// bouncing to their home workspace. Written by the SPA's preferences
+	// PUT and by service-level SwitchTenant (including when switching
+	// home, which stores the home ID). Login / RefreshToken validate that
 	// the workspace still exists and the user still has an active membership
 	// (or CanAccessAllTenants) before honouring this preference; an
 	// invalid pointer is best-effort cleared and the user falls back to
-	// home.
+	// home. Refresh JWT claims have no tenant_id, so RefreshToken
+	// re-resolves from this field.
 	//
 	// nil  = no preference (use user.TenantID, i.e. home)
 	// *0   = "clear preference" sentinel for the partial-update endpoint
@@ -37,6 +40,12 @@ type UserPreferences struct {
 	//        a stored *0 the same as nil.
 	// *N   = preferred workspace id.
 	LastActiveTenantID *uint64 `json:"last_active_tenant_id,omitempty"`
+
+	// OidcOnlyLogin is set server-side when an account is auto-provisioned
+	// via OIDC with a random password the user never received. The profile
+	// UI hides self-service password rotation until the user sets a known
+	// password via ChangePassword (which clears this flag).
+	OidcOnlyLogin *bool `json:"oidc_only_login,omitempty"`
 }
 
 // Value implements driver.Valuer so GORM persists UserPreferences as
@@ -186,6 +195,18 @@ type RegisterRequest struct {
 	// own tenancy semantics. Empty preserves the historical behaviour and is
 	// treated as create_personal by UserService.Register.
 	TenantProvisioning TenantProvisioningMode `json:"-"`
+}
+
+// AdminCreateUserRequest is the payload for a SystemAdmin provisioning a
+// new local user via POST /api/v1/system/admin/users/create.
+//
+// Password is optional: when absent (or null), the service generates a
+// random one and returns it exactly once. Any provided value, the
+// empty string included, is subject to the password policy.
+type AdminCreateUserRequest struct {
+	Username string  `json:"username" binding:"required,min=2,max=50"`
+	Email    string  `json:"email"    binding:"required,email"`
+	Password *string `json:"password"`
 }
 
 // TenantProvisioningMode controls what UserService.Register does after it

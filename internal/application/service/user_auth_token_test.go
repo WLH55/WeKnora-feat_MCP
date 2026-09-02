@@ -216,7 +216,91 @@ func TestAdminResetPasswordRejectsWeakPasswordBeforeWrite(t *testing.T) {
 		t.Fatalf("AdminResetPassword() err = %v, want ErrPasswordPolicy", err)
 	}
 	if repo.updateCalls != 0 || len(tokenRepo.revokedUserIDs) != 0 {
-		t.Fatalf("weak password caused side effects: updates=%d revocations=%v", repo.updateCalls, tokenRepo.revokedUserIDs)
+		t.Fatalf("weak password caused side effects: updates=%d revocations=%v",
+			repo.updateCalls, tokenRepo.revokedUserIDs)
+	}
+}
+
+func TestChangePasswordRequiresPolicyAndRevokesSessions(t *testing.T) {
+	ctx := context.Background()
+	tokenRepo := &stubAuthTokenRepo{tokens: map[string]*types.AuthToken{}}
+	svc := newAuthTestUserService(tokenRepo)
+	repo := svc.userRepo.(*stubUserRepoForAuth)
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte("OldSecure9"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("hash old password: %v", err)
+	}
+	repo.users["user-1"].PasswordHash = string(hashed)
+
+	if err := svc.ChangePassword(ctx, "user-1", "OldSecure9", "weak"); !errors.Is(err, ErrPasswordPolicy) {
+		t.Fatalf("ChangePassword(weak) err = %v, want ErrPasswordPolicy", err)
+	}
+	if repo.updateCalls != 0 || len(tokenRepo.revokedUserIDs) != 0 {
+		t.Fatalf("weak password caused side effects: updates=%d revocations=%v",
+			repo.updateCalls, tokenRepo.revokedUserIDs)
+	}
+
+	if err := svc.ChangePassword(ctx, "user-1", "wrong-pass", "NewSecure9"); !errors.Is(err, ErrInvalidOldPassword) {
+		t.Fatalf("ChangePassword(wrong old) err = %v, want ErrInvalidOldPassword", err)
+	}
+
+	if err := svc.ChangePassword(ctx, "user-1", "OldSecure9", "NewSecure9"); err != nil {
+		t.Fatalf("ChangePassword() err = %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(repo.users["user-1"].PasswordHash), []byte("NewSecure9")); err != nil {
+		t.Fatalf("stored hash does not match new password: %v", err)
+	}
+	if len(tokenRepo.revokedUserIDs) != 1 || tokenRepo.revokedUserIDs[0] != "user-1" {
+		t.Fatalf("revoked users = %v, want [user-1]", tokenRepo.revokedUserIDs)
+	}
+}
+
+func TestChangePasswordRejectsSamePassword(t *testing.T) {
+	ctx := context.Background()
+	tokenRepo := &stubAuthTokenRepo{tokens: map[string]*types.AuthToken{}}
+	svc := newAuthTestUserService(tokenRepo)
+	repo := svc.userRepo.(*stubUserRepoForAuth)
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte("OldSecure9"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("hash old password: %v", err)
+	}
+	repo.users["user-1"].PasswordHash = string(hashed)
+
+	if err := svc.ChangePassword(ctx, "user-1", "OldSecure9", "OldSecure9"); !errors.Is(err, ErrSamePassword) {
+		t.Fatalf("ChangePassword(same) err = %v, want ErrSamePassword", err)
+	}
+	if repo.updateCalls != 0 || len(tokenRepo.revokedUserIDs) != 0 {
+		t.Fatalf("same password caused side effects: updates=%d revocations=%v", repo.updateCalls, tokenRepo.revokedUserIDs)
+	}
+}
+
+func TestChangePasswordHonoursRuntimeComplexPolicy(t *testing.T) {
+	ctx := context.Background()
+	tokenRepo := &stubAuthTokenRepo{tokens: map[string]*types.AuthToken{}}
+	svc := newAuthTestUserService(tokenRepo)
+	svc.systemSettingSvc = &stubComplexPasswordSettings{enabled: true}
+	repo := svc.userRepo.(*stubUserRepoForAuth)
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte("OldSecure9"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("hash old password: %v", err)
+	}
+	repo.users["user-1"].PasswordHash = string(hashed)
+
+	if err := svc.ChangePassword(ctx, "user-1", "wrong-pass", "weak"); !errors.Is(err, ErrInvalidOldPassword) {
+		t.Fatalf("ChangePassword(wrong old, weak new) err = %v, want ErrInvalidOldPassword", err)
+	}
+	if err := svc.ChangePassword(ctx, "user-1", "OldSecure9", "NewSecure9"); !errors.Is(err, ErrComplexPasswordPolicy) {
+		t.Fatalf("ChangePassword(simple new) err = %v, want ErrComplexPasswordPolicy", err)
+	}
+	if repo.updateCalls != 0 || len(tokenRepo.revokedUserIDs) != 0 {
+		t.Fatalf("complex-policy reject caused side effects: updates=%d revocations=%v",
+			repo.updateCalls, tokenRepo.revokedUserIDs)
+	}
+	if err := svc.ChangePassword(ctx, "user-1", "OldSecure9", "NewSecure9!"); err != nil {
+		t.Fatalf("ChangePassword(complex new) err = %v", err)
 	}
 }
 
