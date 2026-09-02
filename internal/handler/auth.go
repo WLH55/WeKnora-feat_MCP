@@ -136,7 +136,7 @@ func resolveDefaultTenantMode(
 	// 当部署关闭了个人自助建空间时，注册也不应发放"注册时给、丢掉后
 	// 不让再建"的个人空间——那会让误删唯一空间的账号死锁在引导页。
 	// 与 tenant.self_service_creation_enabled 保持同一判定入口。
-	if !resolveTenantSelfServiceCreationEnabled(ctx, h.configInfo, h.systemSettingSvc) {
+	if !resolveTenantSelfServiceCreationEnabled(ctx, configInfo, systemSettingSvc) {
 		return types.TenantProvisioningTenantless
 	}
 	return types.TenantProvisioningCreatePersonal
