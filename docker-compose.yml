@@ -829,7 +829,9 @@
       - full
 
   langfuse-clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    # langfuse v3.38+ 的 0039_create_events_full 迁移使用 text(tokenizer=...) 全文索引，
+    # 24.8 不支持该语法（报 "Only literals can be skip index arguments"），必须 25.x
+    image: clickhouse/clickhouse-server:25.12
     container_name: WeKnora-langfuse-clickhouse
     restart: unless-stopped
     user: "101:101"
