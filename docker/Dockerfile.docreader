@@ -113,6 +113,8 @@ RUN apt-get update && apt-get install -y \
 
 # 安装 grpc_health_probe
 ARG TARGETARCH
+# 离线安装包（若放在 packages/ 下则跳过 GitHub 下载，便于受限网络构建）
+COPY packages/ /app/packages/
 # 兼容 BuildKit 和传统构建：如果 TARGETARCH 为空，使用 uname 检测
 RUN if [ -z "$TARGETARCH" ]; then \
         case $(uname -m) in \
@@ -132,7 +134,13 @@ RUN if [ -z "$TARGETARCH" ]; then \
         "arm") ARCH="arm" ;; \
         *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
     esac && \
-    wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-linux-${ARCH} && \
+    if [ -f "/app/packages/grpc_health_probe-linux-${ARCH}" ]; then \
+        echo "发现本地 grpc_health_probe，将进行离线安装"; \
+        cp /app/packages/grpc_health_probe-linux-${ARCH} /bin/grpc_health_probe; \
+    else \
+        echo "未发现本地 grpc_health_probe，将进行在线安装"; \
+        wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-linux-${ARCH}; \
+    fi && \
     chmod +x /bin/grpc_health_probe
 
 # 从构建阶段复制已安装的依赖和生成的代码

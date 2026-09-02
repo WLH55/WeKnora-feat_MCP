@@ -61,6 +61,8 @@ frontend/.vite
 frontend/chrome-extension/
 WeKnora-Chrome-Extension
 packages/protoc-3.19.4-linux-x86_64.zip
+packages/grpc_health_probe-linux-amd64
+packages/grpc_health_probe-linux-arm64
 
 Claude.md
 
