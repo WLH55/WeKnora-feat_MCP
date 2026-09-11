@@ -694,6 +694,8 @@ export default {
     field: {
       appId: 'App ID',
       appSecret: 'App Secret',
+      dingtalkAppKey: 'AppKey (Client ID)',
+      dingtalkOperatorMobile: 'Номер телефона оператора',
       integrationToken: 'Integration Token',
       apiToken: 'API Token',
       imaClientId: 'IMA ClientID',
@@ -714,7 +716,8 @@ export default {
       yuque: 'Синхронизация документов из баз знаний Yuque',
       ima: 'Синхронизация документов, заметок и файлов из баз знаний Tencent IMA (ИИ-сессии и разбор видео не поддерживаются)',
       rss: 'Синхронизация статей из лент RSS / Atom',
-      gitlab: 'Синхронизация файлов из проектов GitLab'
+      gitlab: 'Синхронизация файлов из проектов GitLab',
+      dingtalk: 'Синхронизация онлайн-документов из баз знаний DingTalk'
     },
     connector: {
       feishu: 'Feishu (Фэйшу)',
@@ -725,7 +728,8 @@ export default {
       yuque: 'Yuque (Юйцюэ)',
       ima: 'Tencent IMA',
       rss: 'RSS / Atom лента',
-      gitlab: 'GitLab'
+      gitlab: 'GitLab',
+      dingtalk: 'DingTalk (Динтан)'
     },
     logDetail: {
       startTime: 'Время начала',

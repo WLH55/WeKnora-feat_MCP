@@ -5999,7 +5999,8 @@ export default {
       yuque: 'Yuque',
       rss: 'RSS / Atom Feed',
       ima: 'Tencent IMA',
-      gitlab: 'GitLab'
+      gitlab: 'GitLab',
+      dingtalk: 'DingTalk'
     },
     connectorDesc: {
       feishu: 'Sync documents, spreadsheets and files from Feishu Wiki',
@@ -6010,7 +6011,8 @@ export default {
       yuque: 'Sync documents from Yuque knowledge bases',
       rss: 'Sync articles from RSS / Atom feeds',
       ima: 'Sync documents, notes and files from Tencent IMA knowledge bases (AI sessions and video parses are not supported)',
-      gitlab: 'Sync files from GitLab projects'
+      gitlab: 'Sync files from GitLab projects',
+      dingtalk: 'Sync online documents from DingTalk knowledge bases'
     },
     drive: {
       folderTokenLabel: 'Drive folder token',
@@ -6028,6 +6030,8 @@ export default {
     field: {
       appId: 'App ID',
       appSecret: 'App Secret',
+      dingtalkAppKey: 'AppKey (Client ID)',
+      dingtalkOperatorMobile: 'Operator mobile number',
       integrationToken: 'Integration Token',
       apiToken: 'API Token',
       imaClientId: 'IMA ClientID',

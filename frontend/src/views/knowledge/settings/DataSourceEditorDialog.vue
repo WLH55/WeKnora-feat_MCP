@@ -633,6 +633,28 @@ const connectorDefs = computed<ConnectorDef[]>(() => [
       { key: 'access_token', labelKey: 'datasource.gitlab.accessToken', placeholder: '', secret: true },
     ],
   },
+  {
+    // DingTalk (钉钉) documents. An internal enterprise app authenticates with
+    // AppKey/AppSecret; the operator mobile is resolved to a unionId internally
+    // so users never have to look it up by hand.
+    type: 'dingtalk',
+    available: true,
+    docUrl: 'https://open-dev.dingtalk.com',
+    permissionDocUrl: 'https://open.dingtalk.com/document/development/permission-pointp-mapping-document',
+    permissionPageUrl: 'https://open-dev.dingtalk.com',
+    requiredPermissions: [
+      '知识库读权限 (Wiki.Workspace.Read)',
+      '知识库节点读权限 (Wiki.Node.Read)',
+      '企业存储文件读权限 (Storage.File.Read)',
+      '根据手机号获取成员基本信息权限 (qyapi_get_member_by_mobile)',
+      '成员信息读权限 (qyapi_get_member)',
+    ],
+    fields: [
+      { key: 'app_key', labelKey: 'datasource.field.dingtalkAppKey', placeholder: 'dingxxxxxx' },
+      { key: 'app_secret', labelKey: 'datasource.field.appSecret', placeholder: '', secret: true },
+      { key: 'operator_mobile', labelKey: 'datasource.field.dingtalkOperatorMobile', placeholder: '13800000000' },
+    ],
+  },
 ])
 
 

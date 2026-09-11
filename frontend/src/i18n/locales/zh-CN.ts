@@ -696,6 +696,8 @@ export default {
     field: {
       appId: 'App ID',
       appSecret: 'App Secret',
+      dingtalkAppKey: 'AppKey（Client ID）',
+      dingtalkOperatorMobile: '操作人手机号',
       integrationToken: 'Integration Token',
       apiToken: 'API Token',
       imaClientId: 'IMA ClientID',
@@ -716,7 +718,8 @@ export default {
       yuque: '同步语雀知识库中的文档',
       ima: '同步腾讯 IMA 知识库中的文档、笔记与文件（暂不支持 AI 会话与视频解析）',
       rss: '同步 RSS / Atom 订阅源中的文章',
-      gitlab: '同步 GitLab 项目中的文件'
+      gitlab: '同步 GitLab 项目中的文件',
+      dingtalk: '同步钉钉知识库中的在线文档'
     },
     connector: {
       feishu: '飞书',
@@ -727,7 +730,8 @@ export default {
       yuque: '语雀',
       ima: '腾讯 IMA',
       rss: 'RSS / Atom 订阅',
-      gitlab: 'GitLab'
+      gitlab: 'GitLab',
+      dingtalk: '钉钉'
     },
     logDetail: {
       startTime: '开始时间',

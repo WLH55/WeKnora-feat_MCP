@@ -694,6 +694,8 @@ export default {
     field: {
       appId: 'App ID',
       appSecret: 'App Secret',
+      dingtalkAppKey: 'AppKey (Client ID)',
+      dingtalkOperatorMobile: '운영자 휴대폰 번호',
       integrationToken: 'Integration Token',
       apiToken: 'API Token',
       imaClientId: 'IMA ClientID',
@@ -714,7 +716,8 @@ export default {
       yuque: '위큐 지식베이스에서 문서 동기화',
       ima: 'Tencent IMA 지식베이스에서 문서, 노트 및 파일 동기화 (AI 세션과 동영상 분석은 지원되지 않음)',
       rss: 'RSS / Atom 피드에서 글 동기화',
-      gitlab: 'GitLab 프로젝트의 파일 동기화'
+      gitlab: 'GitLab 프로젝트의 파일 동기화',
+      dingtalk: '딩톡 지식 베이스의 온라인 문서를 동기화합니다'
     },
     connector: {
       feishu: '페이슈 (Feishu)',
@@ -725,7 +728,8 @@ export default {
       yuque: '위큐 (Yuque)',
       ima: 'Tencent IMA',
       rss: 'RSS / Atom 피드',
-      gitlab: 'GitLab'
+      gitlab: 'GitLab',
+      dingtalk: '딩톡 (DingTalk)'
     },
     logDetail: {
       startTime: '시작 시간',

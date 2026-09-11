@@ -55,6 +55,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/datasource"
+	dingtalkConnector "github.com/Tencent/WeKnora/internal/datasource/connector/dingtalk"
 	"github.com/Tencent/WeKnora/internal/datasource/connector/feishu/core"
 	"github.com/Tencent/WeKnora/internal/datasource/connector/feishu/drive"
 	"github.com/Tencent/WeKnora/internal/datasource/connector/feishu/wiki"
@@ -1694,6 +1695,9 @@ func initConnectorRegistry() (*datasource.ConnectorRegistry, error) {
 	}
 	if err := registry.Register(gitlabConnector.NewConnector()); err != nil {
 		errs = errors.Join(errs, fmt.Errorf("register gitlab connector: %w", err))
+	}
+	if err := registry.Register(dingtalkConnector.NewConnector()); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("register dingtalk connector: %w", err))
 	}
 
 	// Future connectors will be registered here:
