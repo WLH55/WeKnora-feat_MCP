@@ -341,6 +341,11 @@ type FetchedItem struct {
 	// Source resource ID (e.g., folder ID this document belongs to)
 	SourceResourceID string `json:"source_resource_id"`
 
+	// FetchError, when non-empty, marks the item as failed at the connector's
+	// fetch stage (e.g. source returned 403). Ingestion is skipped and the
+	// sync result counts it as failed; the next sync retries it.
+	FetchError string `json:"fetch_error,omitempty"`
+
 	// ReplacesSubtree, when true, tells ingestion to reconcile this item's
 	// sub-items: after the parent is (re)ingested, every existing knowledge item
 	// whose external_id starts with SubtreeChildPrefix(ExternalID) that is NOT

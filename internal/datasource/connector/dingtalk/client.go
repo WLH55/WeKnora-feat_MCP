@@ -304,6 +304,18 @@ func (c *client) queryBlocks(ctx context.Context, operatorID, docKey string) ([]
 	return extractBlocks(resp.Result)
 }
 
+// apiStatusError carries the HTTP status of a non-2xx DingTalk response so
+// callers can distinguish "document gone" (404) from "no permission" (403)
+// without string matching. The message keeps the historical format.
+type apiStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *apiStatusError) Error() string {
+	return fmt.Sprintf("dingtalk API error status=%d body=%s", e.Status, e.Body)
+}
+
 // authHeader builds the header map for open-platform calls.
 func (c *client) authHeader(token string) map[string]string {
 	return map[string]string{
@@ -380,7 +392,7 @@ func (c *client) do(
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("dingtalk API error status=%d body=%s", resp.StatusCode, truncate(string(data), 500))
+			return &apiStatusError{Status: resp.StatusCode, Body: truncate(string(data), 500)}
 		}
 
 		if out == nil {

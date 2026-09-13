@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -212,6 +213,38 @@ type blocksResponse struct {
 	Result  json.RawMessage `json:"result"`
 }
 
+// flexInt tolerates numeric fields that the blocks endpoint delivers either
+// as a JSON number or as a string carrying the number, e.g. the documented
+// `heading.level: 2` arrives as "heading-2" from the live API. A plain
+// integer decodes exactly like an int (including negatives); any other
+// payload uses its first run of digits ("heading-2" → 2) and 0 when there
+// is none, so one odd field cannot fail the whole document decode.
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if n, err := strconv.Atoi(s); err == nil {
+		*f = flexInt(n)
+		return nil
+	}
+	s = strings.Trim(s, `"`)
+	start := strings.IndexFunc(s, func(r rune) bool { return r >= '0' && r <= '9' })
+	if start < 0 {
+		*f = 0
+		return nil
+	}
+	end := start
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	n, err := strconv.Atoi(s[start:end])
+	if err != nil {
+		return fmt.Errorf("parse number %s: %w", data, err)
+	}
+	*f = flexInt(n)
+	return nil
+}
+
 // blockElement is one node of a DingTalk online document. The wire format is
 // a discriminator (`blockType`) plus a same-named key carrying the properties,
 // e.g. {"blockType":"paragraph","paragraph":{"text":"foo"}}.
@@ -245,7 +278,7 @@ type inlineElement struct {
 }
 
 type indentProps struct {
-	Left int `json:"left"`
+	Left flexInt `json:"left"`
 }
 
 type paragraphProps struct {
@@ -257,7 +290,7 @@ type paragraphProps struct {
 
 type headingProps struct {
 	Text     string          `json:"text"`
-	Level    int             `json:"level"`
+	Level    flexInt         `json:"level"`
 	Children []inlineElement `json:"children,omitempty"`
 }
 
@@ -283,9 +316,9 @@ type columnsProps struct {
 }
 
 type listObjectProps struct {
-	ListID        string `json:"listId,omitempty"`
-	Level         int    `json:"level"`
-	ListStyleType string `json:"listStyleType,omitempty"`
+	ListID        string  `json:"listId,omitempty"`
+	Level         flexInt `json:"level"`
+	ListStyleType string  `json:"listStyleType,omitempty"`
 }
 
 type listProps struct {
@@ -296,8 +329,8 @@ type listProps struct {
 }
 
 type tableProps struct {
-	RowSize  int            `json:"rolSize,omitempty"`
-	ColSize  int            `json:"colSize,omitempty"`
+	RowSize  flexInt        `json:"rolSize,omitempty"`
+	ColSize  flexInt        `json:"colSize,omitempty"`
 	Cells    [][]string     `json:"cells,omitempty"`
 	Children []blockElement `json:"children,omitempty"`
 }
@@ -315,15 +348,15 @@ type tableCellProps struct {
 }
 
 type textProps struct {
-	Text      string `json:"text"`
-	Size      int    `json:"sz,omitempty"`
-	Color     string `json:"color,omitempty"`
-	Highlight string `json:"highlight,omitempty"`
-	Bold      bool   `json:"bold,omitempty"`
-	Italic    bool   `json:"italic,omitempty"`
-	Strike    bool   `json:"stike,omitempty"` // wire field is "stike" per DingTalk docs
-	Underline bool   `json:"underline,omitempty"`
-	Fonts     string `json:"fonts,omitempty"`
+	Text      string  `json:"text"`
+	Size      flexInt `json:"sz,omitempty"`
+	Color     string  `json:"color,omitempty"`
+	Highlight string  `json:"highlight,omitempty"`
+	Bold      bool    `json:"bold,omitempty"`
+	Italic    bool    `json:"italic,omitempty"`
+	Strike    bool    `json:"stike,omitempty"` // wire field is "stike" per DingTalk docs
+	Underline bool    `json:"underline,omitempty"`
+	Fonts     string  `json:"fonts,omitempty"`
 }
 
 type stickerProps struct {
@@ -344,14 +377,22 @@ type linkProps struct {
 // ddCursor is the connector-specific cursor persisted inside
 // types.SyncCursor.ConnectorCursor. NodeTimes maps workspaceID -> nodeID ->
 // modifiedTime so an incremental run can skip unchanged nodes and detect
-// deletions (a node present last run but absent now).
+// deletions (a node present last run but absent now). DocHashes maps
+// dentryUuid -> SHA-256 of the rendered Markdown for individually-selected
+// documents (resource IDs of the form "doc:<uuid>"), which have no node
+// metadata to compare; a hash absent from the new cursor means the document
+// is gone (deleted in DingTalk or deselected) and is reported as a deletion.
 type ddCursor struct {
 	LastSyncTime time.Time                    `json:"last_sync_time"`
 	NodeTimes    map[string]map[string]string `json:"node_times"`
+	DocHashes    map[string]string            `json:"doc_hashes"`
 }
 
 func newCursor() *ddCursor {
-	return &ddCursor{NodeTimes: make(map[string]map[string]string)}
+	return &ddCursor{
+		NodeTimes: make(map[string]map[string]string),
+		DocHashes: make(map[string]string),
+	}
 }
 
 // encodeCursor wraps a ddCursor into the generic SyncCursor envelope.
@@ -383,6 +424,9 @@ func decodeCursor(cursor *types.SyncCursor) *ddCursor {
 	}
 	if decoded.NodeTimes != nil {
 		out.NodeTimes = decoded.NodeTimes
+	}
+	if decoded.DocHashes != nil {
+		out.DocHashes = decoded.DocHashes
 	}
 	out.LastSyncTime = decoded.LastSyncTime
 	return out

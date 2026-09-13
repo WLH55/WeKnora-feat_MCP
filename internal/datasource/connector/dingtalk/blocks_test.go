@@ -28,7 +28,7 @@ func TestBlocksToMarkdown_ParagraphAndHeading(t *testing.T) {
 func TestBlocksToMarkdown_HeadingLevelClamped(t *testing.T) {
 	for _, tc := range []struct{ in, want int }{{0, 1}, {3, 3}, {9, 6}} {
 		md, err := blocksToMarkdown([]blockElement{
-			{BlockType: "heading", Heading: &headingProps{Level: tc.in, Text: "x"}},
+			{BlockType: "heading", Heading: &headingProps{Level: flexInt(tc.in), Text: "x"}},
 		})
 		if err != nil {
 			t.Fatalf("level %d: %v", tc.in, err)

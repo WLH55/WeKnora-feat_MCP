@@ -6027,6 +6027,14 @@ export default {
       loadAuthHint: 'App credentials are invalid or missing Drive scopes. Check App ID / App Secret and drive:drive:readonly permissions.',
       loadNotFoundHint: 'folder_token does not exist or has been deleted. Verify the token copied from the Feishu Drive folder URL.',
     },
+    dingtalk: {
+      addDocByLink: 'Add document by link',
+      docLinkHint: 'Paste a DingTalk document link to sync documents outside knowledge bases (e.g. My Documents / team files); works alongside knowledge base selections',
+      docLinkPlaceholder: 'https://docs.dingtalk.com/i/nodes/xxxx',
+      addDoc: 'Add',
+      docLinkInvalid: 'Could not parse a document ID from the link. Paste a docs.dingtalk.com or alidocs.dingtalk.com document URL',
+      removeDoc: 'Remove this document',
+    },
     field: {
       appId: 'App ID',
       appSecret: 'App Secret',

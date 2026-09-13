@@ -790,6 +790,14 @@ export default {
       loadAuthHint: "应用凭证无效或缺少云盘权限，请检查 App ID / App Secret 及 drive:drive:readonly 等权限。",
       loadNotFoundHint: "folder_token 不存在或已删除，请确认从飞书云盘文件夹 URL 复制的 token 正确。",
     },
+    dingtalk: {
+      addDocByLink: "按链接添加文档",
+      docLinkHint: "粘贴钉钉文档链接，可同步不在知识库中的文档（如「我的文档」「团队文件」）；与知识库勾选可同时使用",
+      docLinkPlaceholder: "https://docs.dingtalk.com/i/nodes/xxxx",
+      addDoc: "添加",
+      docLinkInvalid: "无法从链接中解析出文档 ID，请粘贴 docs.dingtalk.com 或 alidocs.dingtalk.com 的文档链接",
+      removeDoc: "移除该文档",
+    },
     syncError: {
       deletion_lookup_failed: '删除前查找文档失败，请查看服务器日志',
       deletion_failed: '删除失败，请查看服务器日志',

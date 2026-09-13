@@ -854,6 +854,14 @@ func (s *DataSourceService) applyFetchedItem(
 	ctx context.Context, ds *types.DataSource, item *types.FetchedItem,
 	tagIDs []string, result *types.SyncResult,
 ) {
+	if item.FetchError != "" {
+		// The connector could not fetch this item (e.g. DingTalk 403): keep
+		// any existing copy and count it failed so the sync log surfaces the
+		// problem instead of reporting a silent "success".
+		logger.Warnf(ctx, "failed to fetch item %q (external_id=%s): %s", item.Title, item.ExternalID, item.FetchError)
+		result.Failed++
+		return
+	}
 	if item.IsDeleted {
 		if !ds.SyncDeletions {
 			// Sync deletion disabled: neither count nor delete.

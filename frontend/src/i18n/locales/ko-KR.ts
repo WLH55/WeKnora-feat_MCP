@@ -788,6 +788,14 @@ export default {
       loadAuthHint: "앱 자격 증명이 유효하지 않거나 드라이브 권한이 없습니다. App ID / App Secret 및 drive:drive:readonly 권한을 확인하세요.",
       loadNotFoundHint: "folder_token이 존재하지 않거나 삭제되었습니다. 페이슈 드라이브 폴더 URL에서 복사한 토큰이 맞는지 확인하세요.",
     },
+    dingtalk: {
+      addDocByLink: "링크로 문서 추가",
+      docLinkHint: "딩톡 문서 링크를 붙여넣으면 지식 베이스 외부의 문서(내 문서, 팀 파일 등)도 동기화할 수 있습니다. 지식 베이스 선택과 함께 사용 가능합니다",
+      docLinkPlaceholder: "https://docs.dingtalk.com/i/nodes/xxxx",
+      addDoc: "추가",
+      docLinkInvalid: "링크에서 문서 ID를 확인할 수 없습니다. docs.dingtalk.com 또는 alidocs.dingtalk.com 문서 링크를 붙여넣어 주세요",
+      removeDoc: "이 문서 제거",
+    },
     syncError: {
       deletion_lookup_failed: '삭제 전 항목 조회에 실패했습니다. 서버 로그를 확인하세요',
       deletion_failed: '삭제에 실패했습니다. 서버 로그를 확인하세요',

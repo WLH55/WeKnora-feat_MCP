@@ -48,7 +48,7 @@ func renderBlock(b blockElement) (string, error) {
 		if b.Heading == nil {
 			return "", nil
 		}
-		level := b.Heading.Level
+		level := int(b.Heading.Level)
 		if level < 1 {
 			level = 1
 		}
@@ -219,7 +219,7 @@ func renderList(l *listProps, marker string) string {
 	}
 	level := 0
 	if l.List != nil && l.List.Level > 0 {
-		level = l.List.Level
+		level = int(l.List.Level)
 	}
 	indent := strings.Repeat("  ", level)
 	return indent + marker + " " + text

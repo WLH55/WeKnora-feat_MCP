@@ -1166,8 +1166,54 @@ const selectedResourceCount = computed(() => {
   for (const state of checkStates.value.values()) {
     if (state === 'checked') count++
   }
-  return count
+  return count + dingtalkBareDocIds.value.length
 })
+
+// --- DingTalk: individually-selected documents ("doc:<uuid>" resource IDs) ---
+// The blocks endpoint addresses a document by its dentryUuid regardless of
+// where it lives (knowledge base, 我的文档, 团队文件), so a pasted URL is a
+// first-class selection alongside the knowledge-base tree. Tree cover logic
+// ignores these IDs because the tree never lists them.
+const dingtalkDocUrl = ref('')
+const dingtalkDocError = ref('')
+
+const dingtalkBareDocIds = computed(() =>
+  selectedResourceIds.value.filter(id => id.startsWith('doc:')))
+
+// Extract the dentryUuid from a DingTalk document URL. Accepted shape:
+// https://docs.dingtalk.com/i/nodes/{uuid}... or
+// https://alidocs.dingtalk.com/i/nodes/{uuid}?... — query strings are ignored.
+function parseDingtalkDocKey(url: string): string {
+  const trimmed = url.trim()
+  if (!trimmed) return ''
+  let host = ''
+  try {
+    host = new URL(trimmed).hostname
+  } catch {
+    return ''
+  }
+  if (host !== 'dingtalk.com' && !host.endsWith('.dingtalk.com')) return ''
+  const m = trimmed.match(/\/i\/nodes\/([A-Za-z0-9_-]+)/)
+  return m ? m[1] : ''
+}
+
+function addDingtalkDocByLink() {
+  const key = parseDingtalkDocKey(dingtalkDocUrl.value)
+  if (!key) {
+    dingtalkDocError.value = t('datasource.dingtalk.docLinkInvalid')
+    return
+  }
+  const rid = `doc:${key}`
+  if (!selectedResourceIds.value.includes(rid)) {
+    selectedResourceIds.value = [...selectedResourceIds.value, rid]
+  }
+  dingtalkDocUrl.value = ''
+  dingtalkDocError.value = ''
+}
+
+function removeDingtalkDoc(rid: string) {
+  selectedResourceIds.value = selectedResourceIds.value.filter(id => id !== rid)
+}
 
 const hasExpandableNodes = computed(() => resources.value.some(r => r.has_children))
 
@@ -1603,6 +1649,41 @@ const drawerConfirmText = computed(() => {
       <template v-else>
       <h4 class="setting-drawer__section-title">{{ t('datasource.step.resources') }}</h4>
       <p class="ds-resource-hint">{{ t('datasource.resourceHint') }}</p>
+
+      <!-- DingTalk: paste document links to select individual documents that
+           live outside knowledge bases (我的文档 / 团队文件). Entries share
+           resource_ids with tree picks as "doc:<dentryUuid>". -->
+      <div v-if="form.type === 'dingtalk'" class="ds-doc-link-input">
+        <label class="ds-doc-link-input__label">
+          {{ t('datasource.dingtalk.addDocByLink') }}
+          <t-tooltip :content="t('datasource.dingtalk.docLinkHint')" placement="top">
+            <t-icon name="help-circle" class="ds-doc-link-input__help" />
+          </t-tooltip>
+        </label>
+        <div class="ds-doc-link-input__row">
+          <t-input
+            v-model="dingtalkDocUrl"
+            :placeholder="t('datasource.dingtalk.docLinkPlaceholder')"
+            :status="dingtalkDocError ? 'error' : 'default'"
+            :tips="dingtalkDocError || undefined"
+            clearable
+            @enter="addDingtalkDocByLink"
+            @input="dingtalkDocError = ''"
+          />
+          <t-button variant="outline" @click="addDingtalkDocByLink">
+            {{ t('datasource.dingtalk.addDoc') }}
+          </t-button>
+        </div>
+        <div v-if="dingtalkBareDocIds.length" class="ds-doc-chips">
+          <span v-for="rid in dingtalkBareDocIds" :key="rid" class="ds-doc-chip">
+            <t-icon name="file" size="14px" />
+            <span class="ds-doc-chip__name" :title="rid.slice(4)">{{ rid.slice(4, 20) }}…</span>
+            <button type="button" class="ds-doc-chip__remove" :aria-label="t('datasource.dingtalk.removeDoc')" @click="removeDingtalkDoc(rid)">
+              <t-icon name="close" size="12px" />
+            </button>
+          </span>
+        </div>
+      </div>
 
       <!-- Drive (云盘) root input: shown alongside the tree (not as a switch).
            The user supplies a folder_token (or a Drive folder URL) and clicks
@@ -2324,6 +2405,88 @@ const drawerConfirmText = computed(() => {
   border-radius: 6px;
   background: var(--td-bg-color-page);
   text-align: center;
+}
+
+/* DingTalk "add document by link" block: mirrors the Drive folder input's
+   layout; added documents render as removable chips below the input. */
+.ds-doc-link-input {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--td-border-level-1-color);
+  border-radius: 6px;
+  background: var(--td-bg-color-container);
+}
+
+.ds-doc-link-input__label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--td-text-color-primary);
+}
+
+.ds-doc-link-input__help {
+  font-size: 15px;
+  color: var(--td-text-color-placeholder);
+  cursor: help;
+
+  &:hover {
+    color: var(--td-text-color-secondary);
+  }
+}
+
+.ds-doc-link-input__row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ds-doc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ds-doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px 2px 8px;
+  border: 1px solid var(--td-border-level-2-color);
+  border-radius: 4px;
+  background: var(--td-bg-color-page);
+  font-size: 12px;
+  color: var(--td-text-color-secondary);
+  max-width: 100%;
+}
+
+.ds-doc-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--td-font-family-mono, monospace);
+}
+
+.ds-doc-chip__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--td-text-color-placeholder);
+  cursor: pointer;
+
+  &:hover {
+    background: var(--td-error-color-1);
+    color: var(--td-error-color);
+  }
 }
 
 .ds-drive-placeholder .ds-empty-title {

@@ -208,6 +208,27 @@ func TestExtractBlocks_EmptyAndUnrecognized(t *testing.T) {
 	}
 }
 
+// The live blocks endpoint returns heading.level as a string ("heading-2")
+// although the documentation shows a number. One such field used to fail the
+// whole-array decode ("unrecognized result shape"), dropping the document.
+func TestExtractBlocks_WireStringHeadingLevel(t *testing.T) {
+	raw := `[{"heading":{"level":"heading-2","text":"一、背景"},"blockType":"heading","index":0,"id":"m1"},` +
+		`{"paragraph":{"text":"公司在快速扩张"},"blockType":"paragraph","index":1,"id":"m2"},` +
+		`{"heading":{"level":3,"text":"数字形态"},"blockType":"heading","index":2,"id":"m3"}]`
+	blocks, err := extractBlocks(json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("extractBlocks: %v", err)
+	}
+	md, err := blocksToMarkdown(blocks)
+	if err != nil {
+		t.Fatalf("blocksToMarkdown: %v", err)
+	}
+	want := "## 一、背景\n\n公司在快速扩张\n\n### 数字形态\n"
+	if string(md) != want {
+		t.Fatalf("markdown mismatch:\n got=%q\nwant=%q", string(md), want)
+	}
+}
+
 func TestResourceTypeFor(t *testing.T) {
 	if got := resourceTypeFor(wikiNode{Category: CategoryALIDOC}); got != "document" {
 		t.Fatalf("ALIDOC should be document, got %q", got)
@@ -237,4 +258,69 @@ func TestClientImplementsInterfaces(t *testing.T) {
 	// service dispatches to FetchStream only if this assertion holds.
 	var _ datasource.Connector = (*Connector)(nil)
 	var _ datasource.StreamingConnector = (*Connector)(nil)
+}
+
+func TestBareDocIDRoundTrip(t *testing.T) {
+	const uuid = "mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"
+	if got := makeBareDocID(uuid); got != "doc:"+uuid {
+		t.Fatalf("makeBareDocID = %q", got)
+	}
+	if got := bareDocID(makeBareDocID(uuid)); got != uuid {
+		t.Fatalf("bareDocID round trip = %q", got)
+	}
+	// Knowledge-base resource IDs must not be mistaken for bare docs.
+	for _, rid := range []string{"", "doc:", "By8jQSoKDj1drD0M", "By8jQSoKDj1drD0M/nodeID"} {
+		if got := bareDocID(rid); got != "" {
+			t.Fatalf("bareDocID(%q) = %q, want empty", rid, got)
+		}
+	}
+}
+
+// The three URL shapes observed in the wild: a personal doc on docs.dingtalk.com,
+// a sheet-style doc with a heavy query string, and a wiki node URL with utm
+// parameters. All must yield the dentryUuid after /nodes/.
+func TestDentryUUIDFromURL_RealWorldSamples(t *testing.T) {
+	cases := []struct{ url, want string }{
+		{"https://docs.dingtalk.com/i/nodes/mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p", "mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"},
+		{"https://docs.dingtalk.com/i/nodes/b9Y4gmKWrPz5zbOBijEDl1qyJGXn6lpz?iframeQuery=entrance%3Ddata%26sheetId%3DhERWDMS%26viewId%3DqvGDAH2", "b9Y4gmKWrPz5zbOBijEDl1qyJGXn6lpz"},
+		{"https://alidocs.dingtalk.com/i/nodes/PwkYGxZV3ZmjmynKu3rbRRNEWAgozOKL?utm_scene=team_space", "PwkYGxZV3ZmjmynKu3rbRRNEWAgozOKL"},
+	}
+	for _, tc := range cases {
+		if got := dentryUUIDFromURL(tc.url); got != tc.want {
+			t.Fatalf("dentryUUIDFromURL(%q) = %q, want %q", tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestCursorDocHashesRoundTrip(t *testing.T) {
+	c := &ddCursor{
+		DocHashes: map[string]string{"mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p": "abc123"},
+	}
+	decoded := decodeCursor(encodeCursor(c))
+	if got := decoded.DocHashes["mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"]; got != "abc123" {
+		t.Fatalf("doc hash lost in round trip: %+v", decoded.DocHashes)
+	}
+	if decoded.DocHashes == nil {
+		t.Fatal("decoded.DocHashes must be non-nil")
+	}
+}
+
+func TestDocTitleFromBlocks(t *testing.T) {
+	blocks := []blockElement{
+		{BlockType: "paragraph", Paragraph: &paragraphProps{Text: "正文"}},
+		{BlockType: "heading", Heading: &headingProps{Text: "第一个标题"}},
+	}
+	if got := docTitleFromBlocks(blocks, "someKey123"); got != "第一个标题" {
+		t.Fatalf("title = %q, want first heading", got)
+	}
+	if got := docTitleFromBlocks(nil, "mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"); got != "钉钉文档 mweZ92PV" {
+		t.Fatalf("fallback title = %q", got)
+	}
+}
+
+func TestApiStatusError(t *testing.T) {
+	e := &apiStatusError{Status: 404, Body: `{"code":"not.found"}`}
+	if got := e.Error(); got != `dingtalk API error status=404 body={"code":"not.found"}` {
+		t.Fatalf("unexpected message %q", got)
+	}
 }

@@ -2,7 +2,11 @@ package dingtalk
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,6 +25,11 @@ var (
 // resourceIDSeparator joins workspace and node inside a resource ID. Node IDs
 // (dentryUuid) never contain "/", so splitting on the first occurrence is safe.
 const resourceIDSeparator = "/"
+
+// bareDocPrefix marks a resource ID that addresses one document by its
+// dentryUuid instead of a knowledge base (sub)tree. Colons never occur in
+// DingTalk workspace IDs, so the two resource ID families cannot collide.
+const bareDocPrefix = "doc:"
 
 // Connector implements datasource.Connector for DingTalk documents.
 type Connector struct{}
@@ -234,6 +243,12 @@ func (c *Connector) walk(
 
 	var skipped int
 	for _, rid := range resourceIDs {
+		if docKey := bareDocID(rid); docKey != "" {
+			if err := c.syncBareDoc(ctx, cli, operatorID, docKey, prev, cur, incremental, emit); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		workspaceID, startNode := parseResourceID(rid)
 		if startNode == "" {
 			root, ok := rootByWorkspace[workspaceID]
@@ -273,6 +288,26 @@ func (c *Connector) walk(
 				}); err != nil {
 					return nil, err
 				}
+			}
+		}
+
+		// Bare documents follow the same diff rule: recorded last run but
+		// absent now — deleted in DingTalk (syncBareDoc saw a 404 and left it
+		// out of the new cursor) or deselected in the editor.
+		for docKey := range prev.DocHashes {
+			if _, seen := cur.DocHashes[docKey]; seen {
+				continue
+			}
+			if err := emit(ctx, types.FetchedItem{
+				ExternalID:       docKey,
+				SourceResourceID: makeBareDocID(docKey),
+				IsDeleted:        true,
+				Metadata: map[string]string{
+					"channel": types.ChannelDingtalk,
+					"doc_key": docKey,
+				},
+			}); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -325,8 +360,25 @@ func (c *Connector) walkTree(
 				*skipped++
 			default:
 				if err := c.emitDocument(ctx, cli, operatorID, workspaceID, resourceID, n, emit); err != nil {
-					// Log and continue: one bad document must not fail the sync.
+					// One bad document must not fail the sync, but it must not
+					// vanish either: emit a fetch-failed item so the sync log
+					// counts it failed instead of showing a silent "success"
+					// (the visibility gap behind 7×403 with status success).
 					logger.Warnf(ctx, "[DingTalk] failed to fetch document %s (%q): %v", n.NodeID, n.Name, err)
+					if emitErr := emit(ctx, types.FetchedItem{
+						ExternalID:       n.NodeID,
+						Title:            n.Name,
+						URL:              n.URL,
+						SourceResourceID: resourceID,
+						FetchError:       err.Error(),
+						Metadata: map[string]string{
+							"channel":      types.ChannelDingtalk,
+							"workspace_id": workspaceID,
+							"node_id":      n.NodeID,
+						},
+					}); emitErr != nil {
+						return emitErr
+					}
 				}
 			}
 
@@ -412,6 +464,112 @@ func (c *Connector) rootNodeID(
 	return "", fmt.Errorf("knowledge base %s is not visible to the configured operator", workspaceID)
 }
 
+// syncBareDoc fetches a single document addressed by dentryUuid, bypassing
+// knowledge base traversal entirely. The rendered Markdown is hashed into the
+// cursor for incremental skip. A 404 leaves the doc out of the new cursor so
+// the walk-level deletion diff reports it; any other failure emits a
+// FetchError item (existing copy kept, counted failed, retried next run).
+func (c *Connector) syncBareDoc(
+	ctx context.Context,
+	cli *client,
+	operatorID, docKey string,
+	prev, cur *ddCursor,
+	incremental bool,
+	emit func(context.Context, types.FetchedItem) error,
+) error {
+	blocks, err := cli.queryBlocks(ctx, operatorID, docKey)
+	if err != nil {
+		return handleBareDocFailure(ctx, docKey, err, prev, cur, emit)
+	}
+	content, err := blocksToMarkdown(blocks)
+	if err != nil {
+		return handleBareDocFailure(ctx, docKey, fmt.Errorf("render blocks: %w", err), prev, cur, emit)
+	}
+
+	sum := sha256Hex(content)
+	if incremental && prev != nil && prev.DocHashes[docKey] == sum {
+		cur.DocHashes[docKey] = sum
+		logger.Infof(ctx, "[DingTalk] incremental sync skipped unchanged document %s", docKey)
+		return nil
+	}
+	cur.DocHashes[docKey] = sum
+
+	title := docTitleFromBlocks(blocks, docKey)
+	return emit(ctx, types.FetchedItem{
+		ExternalID:       docKey,
+		Title:            title,
+		Content:          content,
+		ContentType:      "text/markdown",
+		FileName:         sanitizeFileName(title) + ".md",
+		URL:              buildDocURL(docKey),
+		SourceResourceID: makeBareDocID(docKey),
+		Metadata: map[string]string{
+			"channel":  types.ChannelDingtalk,
+			"doc_key":  docKey,
+			"bare_doc": "true",
+		},
+	})
+}
+
+// handleBareDocFailure classifies a bare-doc fetch/render failure. A 404 means
+// the document is gone: it is deliberately left out of the new cursor so the
+// deletion diff emits IsDeleted. Anything else (403, 5xx exhausted, decode
+// error) keeps the document alive — the previous hash is carried forward so
+// the deletion diff stays quiet, and a FetchError item is emitted so the sync
+// log counts it as failed and the next run retries.
+func handleBareDocFailure(
+	ctx context.Context,
+	docKey string,
+	err error,
+	prev, cur *ddCursor,
+	emit func(context.Context, types.FetchedItem) error,
+) error {
+	var statusErr *apiStatusError
+	if errors.As(err, &statusErr) && statusErr.Status == http.StatusNotFound {
+		logger.Infof(ctx, "[DingTalk] document %s is gone (404); will be reported as deleted", docKey)
+		return nil
+	}
+	if prev != nil {
+		if h, ok := prev.DocHashes[docKey]; ok {
+			cur.DocHashes[docKey] = h
+		}
+	}
+	logger.Warnf(ctx, "[DingTalk] failed to fetch document %s: %v", docKey, err)
+	return emit(ctx, types.FetchedItem{
+		ExternalID: docKey,
+		FetchError: err.Error(),
+		URL:        buildDocURL(docKey),
+		Metadata: map[string]string{
+			"channel":  types.ChannelDingtalk,
+			"doc_key":  docKey,
+			"bare_doc": "true",
+		},
+	})
+}
+
+// docTitleFromBlocks picks a title for a bare document: the blocks response
+// carries no title, so the first heading is the best human-readable name.
+// Without one, the doc key prefix stands in so the item is still identifiable.
+func docTitleFromBlocks(blocks []blockElement, docKey string) string {
+	for _, b := range blocks {
+		if b.Heading == nil {
+			continue
+		}
+		if t := strings.TrimSpace(b.Heading.Text); t != "" {
+			return t
+		}
+	}
+	if len(docKey) > 8 {
+		docKey = docKey[:8]
+	}
+	return "钉钉文档 " + docKey
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 // --- helpers ---
 
 func makeResourceID(workspaceID, nodeID string) string {
@@ -426,6 +584,18 @@ func parseResourceID(id string) (workspaceID, nodeID string) {
 		return id[:i], id[i+1:]
 	}
 	return id, ""
+}
+
+// makeBareDocID builds the resource ID for an individually-selected document.
+func makeBareDocID(docKey string) string { return bareDocPrefix + docKey }
+
+// bareDocID returns the dentryUuid of a bare-doc resource ID, or "" when the
+// ID addresses a knowledge base (sub)tree instead.
+func bareDocID(resourceID string) string {
+	if docKey, ok := strings.CutPrefix(resourceID, bareDocPrefix); ok && docKey != "" {
+		return docKey
+	}
+	return ""
 }
 
 func resourceTypeFor(n wikiNode) string {

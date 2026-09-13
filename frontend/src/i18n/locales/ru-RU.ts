@@ -788,6 +788,14 @@ export default {
       loadAuthHint: 'Учётные данные приложения недействительны или отсутствуют области Drive. Проверьте App ID / App Secret и разрешения drive:drive:readonly.',
       loadNotFoundHint: 'folder_token не существует или удалён. Проверьте токен, скопированный из URL папки Feishu Drive.',
     },
+    dingtalk: {
+      addDocByLink: 'Добавить документ по ссылке',
+      docLinkHint: 'Вставьте ссылку на документ DingTalk, чтобы синхронизировать документы вне баз знаний (например, «Мои документы» или файлы команды); сочетается с выбором баз знаний',
+      docLinkPlaceholder: 'https://docs.dingtalk.com/i/nodes/xxxx',
+      addDoc: 'Добавить',
+      docLinkInvalid: 'Не удалось определить ID документа по ссылке. Вставьте ссылку на документ docs.dingtalk.com или alidocs.dingtalk.com',
+      removeDoc: 'Удалить этот документ',
+    },
     syncError: {
       deletion_lookup_failed: 'Не удалось найти элемент перед удалением; подробности в журнале сервера',
       deletion_failed: 'Не удалось удалить элемент; подробности в журнале сервера',
