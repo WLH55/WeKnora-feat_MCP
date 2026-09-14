@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 680">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;600;700&amp;display=swap');
+    text { font-family: 'JetBrains Mono', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="100%" height="100%" fill="#0f172a"/>
+  <rect width="100%" height="100%" fill="url(#grid)"/>
+
+  <!-- Title block -->
+  <text x="40" y="44" fill="white" font-size="16" font-weight="700">基于 WeKnora 的企业私有 AI 知识中枢</text>
+  <text x="40" y="62" fill="#94a3b8" font-size="9">钉钉同步（二开）+ 按人 API Key（二开）+ MCP 双向打通 · 私有化部署</text>
+
+  <!-- Region: 知识进料 -->
+  <rect x="40" y="80" width="280" height="324" rx="12" fill="none" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="52" y="100" fill="#fbbf24" font-size="9" font-weight="600">知识进料</text>
+
+  <!-- Region: 使用入口 -->
+  <rect x="760" y="80" width="280" height="424" rx="12" fill="none" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="772" y="100" fill="#fbbf24" font-size="9" font-weight="600">使用入口</text>
+
+  <!-- Arrows: intake -> core -->
+  <path d="M 320 154 L 374 154" fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-opacity="0.75" marker-end="url(#arrow-cyan)"/>
+  <text x="348" y="144" fill="#94a3b8" font-size="8" text-anchor="middle">自动同步</text>
+  <path d="M 320 254 L 374 254" fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-opacity="0.75" marker-end="url(#arrow-cyan)"/>
+  <path d="M 320 354 L 374 354" fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-opacity="0.75" marker-end="url(#arrow-cyan)"/>
+  <text x="348" y="344" fill="#94a3b8" font-size="8" text-anchor="middle">MCP 沉淀</text>
+
+  <!-- Arrows: core -> entries -->
+  <path d="M 680 154 L 754 154" fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 680 254 L 754 254" fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 680 354 L 754 354" fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 680 454 L 754 454" fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Arrow: core -> API LLM -->
+  <path d="M 530 480 L 530 534" fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="542" y="514" fill="#94a3b8" font-size="8">仅推理请求出网 · 凭据加密</text>
+
+  <!-- ===== Left boxes ===== -->
+  <!-- 钉钉知识库 -->
+  <rect x="40" y="124" width="280" height="60" rx="6" fill="#0f172a"/>
+  <rect x="40" y="124" width="280" height="60" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="180" y="148" fill="white" font-size="11" font-weight="600" text-anchor="middle">钉钉知识库</text>
+  <text x="180" y="166" fill="#94a3b8" font-size="9" text-anchor="middle">整库同步 / 按链接同步单篇</text>
+  <rect x="272" y="116" width="44" height="16" rx="8" fill="rgba(120,53,15,0.9)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="294" y="127" fill="#fbbf24" font-size="8" font-weight="600" text-anchor="middle">二开</text>
+
+  <!-- 手动上传文档 -->
+  <rect x="40" y="224" width="280" height="60" rx="6" fill="#0f172a"/>
+  <rect x="40" y="224" width="280" height="60" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="180" y="248" fill="white" font-size="11" font-weight="600" text-anchor="middle">手动上传文档</text>
+  <text x="180" y="266" fill="#94a3b8" font-size="9" text-anchor="middle">PDF / Word / Excel / 图片等 10+ 格式</text>
+
+  <!-- 本地 AI 编码工具 -->
+  <rect x="40" y="324" width="280" height="60" rx="6" fill="#0f172a"/>
+  <rect x="40" y="324" width="280" height="60" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="180" y="348" fill="white" font-size="11" font-weight="600" text-anchor="middle">本地 AI 编码工具</text>
+  <text x="180" y="366" fill="#94a3b8" font-size="9" text-anchor="middle">ZCode / Claude Code / Cursor</text>
+
+  <!-- ===== Core: WeKnora ===== -->
+  <rect x="380" y="120" width="300" height="360" rx="10" fill="#0f172a"/>
+  <rect x="380" y="120" width="300" height="360" rx="10" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="530" y="152" fill="white" font-size="15" font-weight="700" text-anchor="middle">WeKnora</text>
+  <text x="530" y="172" fill="#94a3b8" font-size="9" text-anchor="middle">内网 Docker 私有化部署 · 单机 4C/8G 起步</text>
+  <line x1="404" y1="188" x2="656" y2="188" stroke="#34d399" stroke-width="1" stroke-opacity="0.3"/>
+
+  <circle cx="404" cy="210.5" r="2" fill="#34d399"/>
+  <text x="414" y="214" fill="#e2e8f0" font-size="10">RAG / Wiki / FAQ 三种知识库</text>
+  <circle cx="404" cy="244.5" r="2" fill="#34d399"/>
+  <text x="414" y="248" fill="#e2e8f0" font-size="10">智能体（ReAct 多步推理）</text>
+  <circle cx="404" cy="278.5" r="2" fill="#34d399"/>
+  <text x="414" y="282" fill="#e2e8f0" font-size="10">四角色 RBAC + 跨部门共享空间</text>
+  <circle cx="404" cy="312.5" r="2" fill="#fbbf24"/>
+  <text x="414" y="316" fill="#fbbf24" font-size="10" font-weight="600">API Key 按人授权（二开）</text>
+  <circle cx="404" cy="346.5" r="2" fill="#34d399"/>
+  <text x="414" y="350" fill="#e2e8f0" font-size="10">模型凭据 AES-256-GCM 加密</text>
+  <circle cx="404" cy="380.5" r="2" fill="#34d399"/>
+  <text x="414" y="384" fill="#e2e8f0" font-size="10">全程操作审计日志</text>
+
+  <rect x="415" y="412" width="230" height="30" rx="15" fill="rgba(6,78,59,0.3)" stroke="#34d399" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="530" y="431" fill="#34d399" font-size="9" text-anchor="middle">文档 / 向量 / 会话数据 不出内网</text>
+
+  <!-- ===== Right boxes ===== -->
+  <!-- Web 对话 -->
+  <rect x="760" y="124" width="280" height="60" rx="6" fill="#0f172a"/>
+  <rect x="760" y="124" width="280" height="60" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="900" y="148" fill="white" font-size="11" font-weight="600" text-anchor="middle">Web 对话</text>
+  <text x="900" y="166" fill="#94a3b8" font-size="9" text-anchor="middle">答案带引用、可溯源</text>
+
+  <!-- 钉钉机器人 -->
+  <rect x="760" y="224" width="280" height="60" rx="6" fill="#0f172a"/>
+  <rect x="760" y="224" width="280" height="60" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="900" y="248" fill="white" font-size="11" font-weight="600" text-anchor="middle">钉钉机器人</text>
+  <text x="900" y="266" fill="#94a3b8" font-size="9" text-anchor="middle">群里 @ 即问</text>
+
+  <!-- 网页嵌入 -->
+  <rect x="760" y="324" width="280" height="60" rx="6" fill="#0f172a"/>
+  <rect x="760" y="324" width="280" height="60" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="900" y="348" fill="white" font-size="11" font-weight="600" text-anchor="middle">网页嵌入</text>
+  <text x="900" y="366" fill="#94a3b8" font-size="9" text-anchor="middle">给内部系统当 AI 客服挂件</text>
+
+  <!-- MCP 检索 -->
+  <rect x="760" y="424" width="280" height="60" rx="6" fill="#0f172a"/>
+  <rect x="760" y="424" width="280" height="60" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="900" y="448" fill="white" font-size="11" font-weight="600" text-anchor="middle">MCP 检索</text>
+  <text x="900" y="466" fill="#94a3b8" font-size="9" text-anchor="middle">本地 AI 编码工具查公司知识</text>
+
+  <!-- ===== External: API LLM ===== -->
+  <rect x="380" y="540" width="300" height="60" rx="6" fill="#0f172a"/>
+  <rect x="380" y="540" width="300" height="60" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="530" y="564" fill="white" font-size="11" font-weight="600" text-anchor="middle">API 大模型（云端 / 本地可切换）</text>
+  <text x="530" y="582" fill="#94a3b8" font-size="9" text-anchor="middle">DeepSeek / Qwen / 混元 · 可切 Ollama 全离线</text>
+
+  <!-- Legend -->
+  <rect x="40" y="630" width="18" height="10" rx="2" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1"/>
+  <text x="64" y="639" fill="#94a3b8" font-size="9">进料源 / 使用入口</text>
+  <rect x="190" y="630" width="18" height="10" rx="2" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1"/>
+  <text x="214" y="639" fill="#94a3b8" font-size="9">WeKnora 知识中枢（内网）</text>
+  <rect x="400" y="626" width="30" height="15" rx="7" fill="rgba(120,53,15,0.9)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="415" y="637" fill="#fbbf24" font-size="8" font-weight="600" text-anchor="middle">二开</text>
+  <text x="438" y="639" fill="#94a3b8" font-size="9">基于开源二次开发</text>
+  <rect x="560" y="630" width="18" height="10" rx="2" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1"/>
+  <text x="584" y="639" fill="#94a3b8" font-size="9">外部服务（仅推理出网）</text>
+</svg>
