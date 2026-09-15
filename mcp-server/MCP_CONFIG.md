@@ -184,7 +184,7 @@ API Key 的能力位（Capabilities）逐工具生效。调用无授权的工具
 | `retrieve` | hybrid_search、list_knowledge_bases、get_knowledge_base、list_knowledge、get_knowledge、list_chunks、wiki_search、wiki_read_page、wiki_index_view |
 | `chat` | chat、agent_chat、create_session、get_session、list_sessions、delete_session |
 | `read_agents` ∨ `chat` ∨ `manage_agents` | list_agents、get_agent |
-| `ingest` | create_knowledge_from_file、create_knowledge_from_url、create_knowledge_from_text、delete_knowledge、delete_chunk |
+| `ingest` | create_knowledge_from_file、create_knowledge_from_url、create_knowledge_from_text、update_knowledge_from_text、delete_knowledge、delete_chunk |
 | `manage_kbs` | create_knowledge_base、delete_knowledge_base |
 | `manage_models`（读也要求） | create_model、list_models、get_model |
 | `manage_spaces` | list_shared_knowledge_bases |

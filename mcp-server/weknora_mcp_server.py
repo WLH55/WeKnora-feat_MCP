@@ -263,10 +263,9 @@ class WeKnoraClient:
             # Execute HTTP request with the specified method. headers are
             # merged over the session defaults so the per-user API key
             # overrides the process-wide one for this request only.
+            caller_headers = kwargs.pop("headers", None)
             response = self.session.request(
-                method, url, headers=self._auth_headers(kwargs.get("headers")), **{
-                    key: value for key, value in kwargs.items() if key != "headers"
-                }
+                method, url, headers=self._auth_headers(caller_headers), **kwargs
             )
             # Raise exception for HTTP error status codes (4xx, 5xx)
             response.raise_for_status()
