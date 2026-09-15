@@ -1,16 +1,3 @@
-# Build the paired extension and fetch the checksum-pinned native daemon.
-# Node runs on the builder architecture; only bsk targets the runtime image.
-FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
-WORKDIR /build
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends git python3 ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
-COPY patches/browserskill ./patches/browserskill
-ARG TARGETOS
-ARG TARGETARCH
-RUN bash scripts/build_browserskill.sh /opt/weknora/browserskill "${TARGETOS}/${TARGETARCH}"
-
 # Build stage
 FROM golang:1.26-bookworm AS builder
 
@@ -82,6 +69,28 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         make build-prod; \
     fi
 RUN --mount=type=cache,target=/go/pkg/mod cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
+
+# Build the paired extension and fetch the checksum-pinned native daemon.
+# Node runs on the builder architecture; only bsk targets the runtime image.
+# Placed after the builder stage: the node slim base ships without
+# ca-certificates, and the apt mirror + git clone + release download below
+# are all HTTPS, so the CA bundle is copied over from the builder first
+# (same chicken-and-egg as the final stage).
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
+WORKDIR /build
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ARG APK_MIRROR_ARG
+RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends git python3 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
+COPY patches/browserskill ./patches/browserskill
+ARG TARGETOS
+ARG TARGETARCH
+RUN bash scripts/build_browserskill.sh /opt/weknora/browserskill "${TARGETOS}/${TARGETARCH}"
 
 # Final stage
 FROM debian:12.12-slim

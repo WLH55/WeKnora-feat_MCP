@@ -23,3 +23,13 @@ frontend/src/config/deploymentCapabilities.ts text eol=lf
 
 # Unified diffs use a space to mark empty context lines.
 patches/browserskill/*.patch whitespace=-blank-at-eol
+
+# Go module files feed byte-equal checks inside Linux builds (license bundle
+# version pins); CRLF working-tree checkouts leave a trailing  on direct-dep
+# version tokens and break awk comparisons in scripts/check-license-bundle.sh.
+go.mod text eol=lf
+go.sum text eol=lf
+
+# git apply inside the browserskill image build needs byte-exact context;
+# CRLF checkouts make every hunk "patch does not apply".
+patches/browserskill/*.patch text eol=lf
