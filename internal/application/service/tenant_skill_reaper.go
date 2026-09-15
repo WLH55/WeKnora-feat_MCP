@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/sandbox"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/robfig/cron/v3"
 )
@@ -134,9 +136,10 @@ func (s *TenantSkillService) ReapStuckRuns(ctx context.Context) (int, error) {
 			}
 			reaped++
 		case types.SkillStatusRemoving:
-			// Deleting the row and its bundle is the one irreversible thing
-			// the reaper does, so a run it cannot judge is left for the next
-			// sweep rather than guessed at.
+			// Deleting the leftover install row is irreversible, so a run the
+			// reaper cannot judge is left for the next sweep rather than
+			// guessed at. The catalog archive is not touched: this is a
+			// sandbox install, not a definition delete.
 			if !known {
 				continue
 			}
@@ -156,13 +159,15 @@ func (s *TenantSkillService) ReapStuckRuns(ctx context.Context) (int, error) {
 				reaped++
 				continue
 			}
+			pinned := strings.TrimSpace(row.BundleRef)
 			if err := s.skills.DeleteSkill(ctx, row.TenantID, row.SandboxConfigID, row.ID); err != nil {
 				logger.Warnf(ctx, "[skill] drop abandoned removal %s failed: %v", row.ID, err)
 				continue
 			}
-			if row.BundleRef != "" {
-				s.deleteBundleBestEffort(ctx, row.TenantID, row.BundleRef)
-			}
+			// The row was the last thing naming an archive it owned outright,
+			// so the sweep that drops it is what makes those bytes reachable
+			// by nothing. A definition's own object has other names and stays.
+			s.releaseInstallBundle(ctx, row.TenantID, pinned)
 			reaped++
 		}
 	}
@@ -753,10 +758,15 @@ func (s *TenantSkillService) reconcileAllSnapshots(ctx context.Context) {
 }
 
 func (s *TenantSkillService) runSkillReaper(ctx context.Context) {
+	ctx, span := langfuse.GetManager().StartSpan(ctx, langfuse.SpanOptions{Name: "skill.maintenance"})
+	var sweepErr error
+	defer func() { span.Finish(nil, nil, sweepErr) }()
 	if _, err := s.ReapStuckRuns(ctx); err != nil {
+		sweepErr = errors.Join(sweepErr, err)
 		logger.Warnf(ctx, "[skill] reap stuck runs failed: %v", err)
 	}
 	if _, err := s.PruneSupersededSnapshots(ctx); err != nil {
+		sweepErr = errors.Join(sweepErr, err)
 		logger.Warnf(ctx, "[skill] prune superseded snapshots failed: %v", err)
 	}
 	s.reconcileAllSnapshots(ctx)

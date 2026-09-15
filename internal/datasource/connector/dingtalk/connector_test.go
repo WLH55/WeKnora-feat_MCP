@@ -1,326 +1,443 @@
 package dingtalk
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-func TestParseConfig_RequiresCredentials(t *testing.T) {
-	cases := []struct {
-		name string
-		cred map[string]interface{}
-	}{
-		{"missing everything", map[string]interface{}{}},
-		{"missing secret", map[string]interface{}{"app_key": "k", "operator_mobile": "13800000000"}},
-		{"missing mobile", map[string]interface{}{"app_key": "k", "app_secret": "s"}},
+type fakeAPI struct {
+	workspaces  []workspace
+	nodes       map[string][]node
+	blocks      map[string][]json.RawMessage
+	nodeErrors  map[string]error
+	blockErrors map[string]error
+	blockCalls  map[string]int
+}
+
+func (f *fakeAPI) listWorkspaces(context.Context) ([]workspace, error) {
+	return f.workspaces, nil
+}
+
+func (f *fakeAPI) listNodes(_ context.Context, parentID string) ([]node, error) {
+	if err := f.nodeErrors[parentID]; err != nil {
+		return nil, err
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseConfig(&types.DataSourceConfig{Credentials: tc.cred})
-			if err == nil {
-				t.Fatal("expected error for incomplete credentials")
-			}
-		})
+	return f.nodes[parentID], nil
+}
+
+func (f *fakeAPI) documentBlocks(_ context.Context, documentID string) ([]json.RawMessage, error) {
+	if f.blockCalls == nil {
+		f.blockCalls = make(map[string]int)
+	}
+	f.blockCalls[documentID]++
+	if err := f.blockErrors[documentID]; err != nil {
+		return nil, err
+	}
+	return f.blocks[documentID], nil
+}
+
+func testConnector(api dingTalkAPI) *Connector {
+	return &Connector{newAPI: func(*config) dingTalkAPI { return api }}
+}
+
+func testConfig(resources ...string) *types.DataSourceConfig {
+	return &types.DataSourceConfig{
+		Type: types.ConnectorTypeDingTalk,
+		Credentials: map[string]interface{}{
+			"client_id":     "ding-app",
+			"client_secret": "secret",
+			"operator_id":   "union-id",
+		},
+		ResourceIDs: resources,
 	}
 }
 
-func TestParseConfig_OKAndNormalizesMobile(t *testing.T) {
-	cfg, err := parseConfig(&types.DataSourceConfig{Credentials: map[string]interface{}{
-		"app_key":         "  dingabc  ",
-		"app_secret":      "secret",
-		"operator_mobile": "+86 138-0000-0000",
-	}})
+func rawJSON(value string) json.RawMessage {
+	return json.RawMessage(value)
+}
+
+func TestConnectorListsWorkspacesAndFetchesNestedDocuments(t *testing.T) {
+	api := &fakeAPI{
+		workspaces: []workspace{
+			{ID: "b", RootNodeID: "root-b", Name: "Beta"},
+			{ID: "a", RootNodeID: "root-a", Name: "Alpha", Description: "Team docs"},
+		},
+		nodes: map[string][]node{
+			"root-a": {
+				{ID: "folder", Type: "FOLDER"},
+				{ID: "ignored", Type: "FILE", Category: "FILE", Extension: "pdf"},
+			},
+			"folder": {
+				{
+					ID: "doc-1", Type: "FILE", Category: "ALIDOC", Extension: "adoc",
+					Name: "Roadmap", WorkspaceID: "a", ModifiedTime: "2026-07-25T08:00:00Z",
+				},
+			},
+		},
+		blocks: map[string][]json.RawMessage{
+			"doc-1": {rawJSON(`{
+				"blockType":"paragraph",
+				"children":[{"elementType":"text","text":"Q3 goals","bold":true}]
+			}`)},
+		},
+		nodeErrors:  make(map[string]error),
+		blockErrors: make(map[string]error),
+	}
+	connector := testConnector(api)
+
+	resources, err := connector.ListResources(context.Background(), testConfig(), "")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ListResources() error = %v", err)
 	}
-	if cfg.AppKey != "dingabc" {
-		t.Fatalf("app_key not trimmed: %q", cfg.AppKey)
+	if len(resources) != 2 || resources[0].ExternalID != "a" || resources[1].ExternalID != "b" {
+		t.Fatalf("ListResources() = %#v, want workspaces sorted by name", resources)
 	}
-	if cfg.OperatorMobile != "13800000000" {
-		t.Fatalf("mobile not normalized: %q", cfg.OperatorMobile)
+	if !resources[0].HasChildren {
+		t.Fatalf("workspace resource = %#v, want expandable", resources[0])
 	}
-	if cfg.GetAPIBaseURL() != DefaultAPIBaseURL {
-		t.Fatalf("default api base URL wrong: %q", cfg.GetAPIBaseURL())
+	children, err := connector.ListResources(context.Background(), testConfig(), "a")
+	if err != nil || len(children) != 1 || children[0].Type != "folder" {
+		t.Fatalf("workspace children = %#v, %v; want one folder", children, err)
 	}
-	if cfg.GetOAPIBaseURL() != DefaultOAPIBaseURL {
-		t.Fatalf("default oapi base URL wrong: %q", cfg.GetOAPIBaseURL())
+	folderID := children[0].ExternalID
+	documents, err := connector.ListResources(context.Background(), testConfig(), folderID)
+	if err != nil || len(documents) != 1 || documents[0].Type != "document" {
+		t.Fatalf("folder children = %#v, %v; want one document", documents, err)
+	}
+	if _, err := connector.ListResources(
+		context.Background(), testConfig(), documents[0].ExternalID,
+	); !errors.Is(err, datasource.ErrResourceNotFound) {
+		t.Fatalf("expanding a document error = %v, want ErrResourceNotFound", err)
+	}
+	ancestors, err := connector.ResolveResourceAncestors(
+		context.Background(), testConfig(), []string{documents[0].ExternalID},
+	)
+	if err != nil || len(ancestors) != 2 || ancestors[0] != "a" || ancestors[1] != folderID {
+		t.Fatalf("ResolveResourceAncestors() = %#v, %v", ancestors, err)
+	}
+
+	items, err := connector.FetchAll(context.Background(), testConfig("a"), []string{"a"})
+	if err != nil {
+		t.Fatalf("FetchAll() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("FetchAll() returned %d items, want 1", len(items))
+	}
+	item := items[0]
+	if item.ExternalID != "doc-1" || item.Title != "Roadmap" ||
+		string(item.Content) != "# Roadmap\n\n**Q3 goals**\n" {
+		t.Fatalf("FetchAll() item = %#v", item)
+	}
+	if item.ContentType != "text/markdown" || item.SourceResourceID != "a" ||
+		item.Metadata["channel"] != types.ChannelDingtalk {
+		t.Fatalf("FetchAll() metadata = %#v", item)
 	}
 }
 
-func TestParseConfig_RejectsHugePageSettings(t *testing.T) {
-	// Guard: base URL override must pass SSRF validation. A loopback host is
-	// rejected by ValidateConnectorBaseURL, which parseConfig must surface.
-	_, err := parseConfig(&types.DataSourceConfig{Credentials: map[string]interface{}{
-		"app_key":         "k",
-		"app_secret":      "s",
-		"operator_mobile": "13800000000",
-		"base_url":        "http://127.0.0.1:8080",
-	}})
-	if err == nil {
-		t.Fatal("expected SSRF validation to reject loopback base_url")
+func TestIncrementalSyncRetriesFailuresAndReportsDeletions(t *testing.T) {
+	api := &fakeAPI{
+		workspaces: []workspace{{ID: "space", RootNodeID: "root", Name: "Space"}},
+		nodes: map[string][]node{
+			"root": {
+				{ID: "unchanged", Type: "FILE", Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r1"},
+				{ID: "changed", Type: "FILE", Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r2"},
+				{ID: "broken", Type: "FILE", Category: "ALIDOC", Extension: "adoc", ModifiedTime: "r2"},
+			},
+		},
+		blocks: map[string][]json.RawMessage{
+			"changed": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"updated"}}`)},
+		},
+		nodeErrors:  make(map[string]error),
+		blockErrors: map[string]error{"broken": errors.New("permission denied")},
+	}
+	connector := testConnector(api)
+	cursorMap, err := encodeCursor(&cursorState{
+		Version: cursorVersion,
+		Resources: map[string]map[string]string{
+			"space": {
+				"unchanged": "r1",
+				"changed":   "r1",
+				"broken":    "r1",
+				"deleted":   "r1",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items, next, syncErr := connector.FetchIncremental(
+		context.Background(),
+		testConfig("space"),
+		&types.SyncCursor{ConnectorCursor: cursorMap},
+	)
+	var partial *datasource.PartialFetchError
+	if !errors.As(syncErr, &partial) {
+		t.Fatalf("FetchIncremental() error = %v, want PartialFetchError", syncErr)
+	}
+	if next == nil {
+		t.Fatal("FetchIncremental() returned nil cursor")
+	}
+	if api.blockCalls["unchanged"] != 0 || api.blockCalls["changed"] != 1 ||
+		api.blockCalls["broken"] != 1 {
+		t.Fatalf("document block calls = %#v", api.blockCalls)
+	}
+
+	byID := make(map[string]types.FetchedItem, len(items))
+	for _, item := range items {
+		byID[item.ExternalID] = item
+	}
+	if len(byID) != 3 || !byID["deleted"].IsDeleted {
+		t.Fatalf("FetchIncremental() items = %#v", items)
+	}
+	if byID["broken"].Metadata["error"] == "" {
+		t.Fatalf("failed item metadata = %#v", byID["broken"].Metadata)
+	}
+
+	decoded, err := decodeCursor(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisions := decoded.Resources["space"]
+	if revisions["unchanged"] != "r1" || revisions["changed"] != "r2" ||
+		revisions["broken"] != "r1" {
+		t.Fatalf("next cursor revisions = %#v", revisions)
+	}
+	if _, exists := revisions["deleted"]; exists {
+		t.Fatalf("deleted document remained in cursor: %#v", revisions)
 	}
 }
 
-func TestNormalizeMobile(t *testing.T) {
-	for in, want := range map[string]string{
-		"13800000000":       "13800000000",
-		"+86 138-0000-0000": "13800000000",
-		"86 13800000000":    "13800000000",
-		" 13800000000 ":     "13800000000",
+func TestIncrementalSyncDoesNotInferDeletionsFromIncompleteTree(t *testing.T) {
+	api := &fakeAPI{
+		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
+		nodes: map[string][]node{
+			"root": {{ID: "folder", Type: "FOLDER"}},
+		},
+		nodeErrors:  map[string]error{"folder": errors.New("temporary failure")},
+		blockErrors: make(map[string]error),
+	}
+	cursorMap, err := encodeCursor(&cursorState{
+		Version: cursorVersion,
+		Resources: map[string]map[string]string{
+			"space": {"existing": "r1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items, next, err := testConnector(api).FetchIncremental(
+		context.Background(),
+		testConfig("space"),
+		&types.SyncCursor{ConnectorCursor: cursorMap},
+	)
+	var partial *datasource.PartialFetchError
+	if !errors.As(err, &partial) {
+		t.Fatalf("FetchIncremental() error = %v, want PartialFetchError", err)
+	}
+	if len(items) != 1 || items[0].Metadata["error_reason_code"] != "dingtalk_resource_failed" || next == nil {
+		t.Fatalf("FetchIncremental() = %#v, %#v; want preserved cursor", items, next)
+	}
+	decoded, decodeErr := decodeCursor(next)
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if decoded.Resources["space"]["existing"] != "r1" {
+		t.Fatalf("preserved cursor = %#v", decoded.Resources)
+	}
+}
+
+func TestConnectorSupportsFolderAndDocumentScopesWithoutDuplicates(t *testing.T) {
+	api := &fakeAPI{
+		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
+		nodes: map[string][]node{
+			"root": {
+				{ID: "folder", WorkspaceID: "space", Type: "FOLDER", Name: "Folder"},
+				{
+					ID: "standalone", WorkspaceID: "space", Type: "FILE",
+					Category: "ALIDOC", Extension: "adoc", Name: "Standalone",
+				},
+			},
+			"folder": {
+				{
+					ID: "nested", WorkspaceID: "space", Type: "FILE",
+					Category: "ALIDOC", Extension: "adoc", Name: "Nested",
+				},
+			},
+		},
+		blocks: map[string][]json.RawMessage{
+			"standalone": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"one"}}`)},
+			"nested":     {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"two"}}`)},
+		},
+		nodeErrors:  make(map[string]error),
+		blockErrors: make(map[string]error),
+	}
+	connector := testConnector(api)
+	folderID, err := encodeResourceReference(resourceReference{
+		WorkspaceID: "space", NodeID: "folder",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nestedID, err := encodeResourceReference(resourceReference{
+		WorkspaceID: "space", NodeID: "nested", Ancestors: []string{"folder"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	standaloneID, err := encodeResourceReference(resourceReference{
+		WorkspaceID: "space", NodeID: "standalone",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := connector.FetchAll(
+		context.Background(),
+		testConfig(folderID, nestedID, standaloneID),
+		[]string{folderID, nestedID, standaloneID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || api.blockCalls["nested"] != 1 || api.blockCalls["standalone"] != 1 {
+		t.Fatalf("items = %#v, block calls = %#v", items, api.blockCalls)
+	}
+	byID := make(map[string]types.FetchedItem, len(items))
+	for _, item := range items {
+		byID[item.ExternalID] = item
+	}
+	if byID["nested"].SourceResourceID != folderID ||
+		byID["standalone"].SourceResourceID != standaloneID {
+		t.Fatalf("source resource IDs = %#v", byID)
+	}
+}
+
+func TestConnectorRejectsCrossWorkspaceResourcePath(t *testing.T) {
+	api := &fakeAPI{
+		workspaces: []workspace{
+			{ID: "space-a", RootNodeID: "root-a"},
+			{ID: "space-b", RootNodeID: "root-b"},
+		},
+		nodes: map[string][]node{
+			"root-a": {{
+				ID: "foreign", WorkspaceID: "space-b", Type: "FILE",
+				Category: "ALIDOC", Extension: "adoc",
+			}},
+		},
+		nodeErrors:  make(map[string]error),
+		blockErrors: make(map[string]error),
+	}
+	resourceID, err := encodeResourceReference(resourceReference{
+		WorkspaceID: "space-a", NodeID: "foreign",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := testConnector(api).FetchAll(
+		context.Background(), testConfig(resourceID), []string{resourceID},
+	)
+	var partial *datasource.PartialFetchError
+	if !errors.As(err, &partial) || len(items) != 1 ||
+		!strings.Contains(items[0].Metadata["error"], "different workspace") || len(api.blockCalls) != 0 {
+		t.Fatalf("FetchAll() = %#v, %v; want isolated workspace mismatch", items, err)
+	}
+}
+
+func TestDecodeCursorMigratesWorkspaceCursorV1(t *testing.T) {
+	cursor := &types.SyncCursor{ConnectorCursor: map[string]interface{}{
+		"version": 1,
+		"workspaces": map[string]interface{}{
+			"legacy-space": map[string]interface{}{"document": "revision"},
+		},
+	}}
+	decoded, err := decodeCursor(cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Version != cursorVersion ||
+		decoded.Resources["legacy-space"]["document"] != "revision" {
+		t.Fatalf("decoded cursor = %#v", decoded)
+	}
+}
+
+func TestParseConfigRejectsMissingCredentials(t *testing.T) {
+	for _, credentials := range []map[string]interface{}{
+		nil,
+		{"client_id": "app"},
+		{"client_id": "app", "client_secret": "secret"},
+		{"client_id": 42, "client_secret": "secret", "operator_id": "operator"},
 	} {
-		if got := normalizeMobile(in); got != want {
-			t.Fatalf("normalizeMobile(%q)=%q want %q", in, got, want)
+		_, err := parseConfig(&types.DataSourceConfig{Credentials: credentials})
+		if !errors.Is(err, datasource.ErrInvalidCredentials) {
+			t.Fatalf("parseConfig(%#v) error = %v", credentials, err)
 		}
 	}
 }
 
-func TestCursorEncodeDecodeRoundTrip(t *testing.T) {
-	c := newCursor()
-	c.LastSyncTime = time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
-	c.NodeTimes["ws-1"] = map[string]string{"n1": "2026-09-10T10:00Z", "n2": "2026-09-09T08:00Z"}
+func TestNodeRevisionPrefersMillisecondTimestamp(t *testing.T) {
+	n := node{ModifiedTime: "2023-05-15T11:29Z", ModifiedTimestamp: 1_684_148_940_123}
+	if n.revision() != "1684148940123" {
+		t.Fatalf("revision() = %q, want millisecond timestamp", n.revision())
+	}
+	if got := n.modifiedAt(); got.UnixMilli() != 1_684_148_940_123 {
+		t.Fatalf("modifiedAt() = %s", got)
+	}
 
-	encoded := encodeCursor(c)
-	if encoded.ConnectorCursor == nil {
-		t.Fatal("encoded cursor has no ConnectorCursor payload")
+	onlyTime := node{ModifiedTime: "2023-05-15T11:29Z"}
+	if onlyTime.revision() != "2023-05-15T11:29Z" {
+		t.Fatalf("revision() without timestamp = %q", onlyTime.revision())
 	}
-	decoded := decodeCursor(encoded)
-	if !decoded.LastSyncTime.Equal(c.LastSyncTime) {
-		t.Fatalf("last sync time lost: got %v want %v", decoded.LastSyncTime, c.LastSyncTime)
-	}
-	if got := decoded.NodeTimes["ws-1"]["n1"]; got != "2026-09-10T10:00Z" {
-		t.Fatalf("node time lost: %q", got)
-	}
-	if got := decoded.NodeTimes["ws-1"]["n2"]; got != "2026-09-09T08:00Z" {
-		t.Fatalf("node time lost: %q", got)
+	if onlyTime.modifiedAt().IsZero() {
+		t.Fatal("modifiedAt() rejected documented minute-precision time")
 	}
 }
 
-func TestDecodeCursor_NilIsEmptyBaseline(t *testing.T) {
-	d := decodeCursor(nil)
-	if d == nil || len(d.NodeTimes) != 0 {
-		t.Fatalf("nil cursor should decode to empty baseline, got %+v", d)
-	}
-	if d.LastSyncTime.IsZero() != true {
-		t.Fatal("empty baseline should have zero LastSyncTime")
+func TestParseDingTalkTimeAcceptsMinutePrecision(t *testing.T) {
+	parsed := parseDingTalkTime("2023-05-15T11:29Z")
+	if parsed.IsZero() || parsed.UTC().Format("2006-01-02T15:04Z") != "2023-05-15T11:29Z" {
+		t.Fatalf("parseDingTalkTime() = %s", parsed)
 	}
 }
 
-func TestDecodeCursor_MalformedPayloadIsEmptyBaseline(t *testing.T) {
-	d := decodeCursor(&types.SyncCursor{ConnectorCursor: map[string]interface{}{"node_times": "not-a-map"}})
-	if d == nil || len(d.NodeTimes) != 0 {
-		t.Fatalf("malformed cursor should fall back to empty baseline, got %+v", d)
+func TestValidateProbesNodeAndDocumentAccess(t *testing.T) {
+	api := &fakeAPI{
+		workspaces: []workspace{{ID: "space", RootNodeID: "root"}},
+		nodes: map[string][]node{
+			"root": {syncDocument()},
+		},
+		blocks: map[string][]json.RawMessage{
+			"doc": {rawJSON(`{"blockType":"paragraph","paragraph":{"text":"ok"}}`)},
+		},
+		nodeErrors:  make(map[string]error),
+		blockErrors: make(map[string]error),
 	}
-}
+	if err := testConnector(api).Validate(context.Background(), testConfig()); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if api.blockCalls["doc"] != 1 {
+		t.Fatalf("document probe calls = %#v", api.blockCalls)
+	}
 
-func TestResourceIDRoundTrip(t *testing.T) {
-	id := makeResourceID("ws-1", "node-9")
-	if id != "ws-1/node-9" {
-		t.Fatalf("makeResourceID=%q", id)
+	api.blockErrors["doc"] = errors.New("missing Storage.File.Read")
+	if err := testConnector(api).Validate(context.Background(), testConfig()); err == nil {
+		t.Fatal("Validate() error = nil, want document access failure")
 	}
-	ws, node := parseResourceID(id)
-	if ws != "ws-1" || node != "node-9" {
-		t.Fatalf("parseResourceID=(%q,%q)", ws, node)
-	}
-	// A bare workspace id yields an empty node (root expansion).
-	ws2, node2 := parseResourceID("ws-2")
-	if ws2 != "ws-2" || node2 != "" {
-		t.Fatalf("bare parse=(%q,%q)", ws2, node2)
-	}
-}
 
-func TestDentryUUIDFromURL(t *testing.T) {
-	for in, want := range map[string]string{
-		"https://alidocs.dingtalk.com/i/nodes/Zxxxxa-id":     "Zxxxxa-id",
-		"https://alidocs.dingtalk.com/i/nodes/abc123?from=x": "abc123",
-		"https://alidocs.dingtalk.com/i/nodes/abc123#frag":   "abc123",
-		"https://example.com/no-marker":                      "",
-		"":                                                   "",
-	} {
-		if got := dentryUUIDFromURL(in); got != want {
-			t.Fatalf("dentryUUIDFromURL(%q)=%q want %q", in, got, want)
-		}
+	api = &fakeAPI{
+		workspaces:  []workspace{{ID: "space", RootNodeID: "root"}},
+		nodes:       map[string][]node{},
+		nodeErrors:  map[string]error{"root": errors.New("missing Wiki.Node.Read")},
+		blockErrors: make(map[string]error),
 	}
-}
-
-func TestDocKeyOf_PrefersURLThenNodeID(t *testing.T) {
-	if got := docKeyOf(wikiNode{NodeID: "n1", URL: "https://alidocs.dingtalk.com/i/nodes/uuid-1"}); got != "uuid-1" {
-		t.Fatalf("expected uuid from URL, got %q", got)
-	}
-	if got := docKeyOf(wikiNode{NodeID: "n1", URL: "https://example.com/other"}); got != "n1" {
-		t.Fatalf("expected nodeId fallback, got %q", got)
-	}
-}
-
-func TestParseDingTalkTime(t *testing.T) {
-	// The documented shape omits seconds.
-	got := parseDingTalkTime("2023-05-15T11:29Z")
-	if got.IsZero() {
-		t.Fatal("failed to parse minute-precision timestamp")
-	}
-	if got.UTC().Format(time.RFC3339) != "2023-05-15T11:29:00Z" {
-		t.Fatalf("unexpected parsed time: %v", got.UTC().Format(time.RFC3339))
-	}
-	if !parseDingTalkTime("").IsZero() {
-		t.Fatal("empty input should be zero time")
-	}
-	if !parseDingTalkTime("garbage").IsZero() {
-		t.Fatal("invalid input should be zero time")
-	}
-}
-
-func TestSanitizeFileName(t *testing.T) {
-	if got := sanitizeFileName("a/b:c*d?e\"f<g>h|i"); got != "a_b_c_d_e_f_g_h_i" {
-		t.Fatalf("sanitizeFileName=%q", got)
-	}
-	if got := sanitizeFileName("   "); got != "document" {
-		t.Fatalf("blank name should fall back to document, got %q", got)
-	}
-}
-
-func TestExtractBlocks_AcceptsKnownShapes(t *testing.T) {
-	shapes := []string{
-		`[{"blockType":"paragraph","paragraph":{"text":"a"}}]`,
-		`{"blocks":[{"blockType":"paragraph","paragraph":{"text":"a"}}]}`,
-		`{"data":[{"blockType":"paragraph","paragraph":{"text":"a"}}]}`,
-		`{"data":{"blocks":[{"blockType":"paragraph","paragraph":{"text":"a"}}]}}`,
-	}
-	for _, raw := range shapes {
-		got, err := extractBlocks(json.RawMessage(raw))
-		if err != nil {
-			t.Fatalf("shape %s: unexpected error %v", raw, err)
-		}
-		if len(got) != 1 || got[0].Paragraph == nil || got[0].Paragraph.Text != "a" {
-			t.Fatalf("shape %s: decoded %+v", raw, got)
-		}
-	}
-}
-
-func TestExtractBlocks_EmptyAndUnrecognized(t *testing.T) {
-	if got, err := extractBlocks(json.RawMessage(`null`)); err != nil || got != nil {
-		t.Fatalf("null should yield nil,nil got %v,%v", got, err)
-	}
-	if _, err := extractBlocks(json.RawMessage(`"a string"`)); err == nil {
-		t.Fatal("unrecognized shape should error")
-	}
-}
-
-// The live blocks endpoint returns heading.level as a string ("heading-2")
-// although the documentation shows a number. One such field used to fail the
-// whole-array decode ("unrecognized result shape"), dropping the document.
-func TestExtractBlocks_WireStringHeadingLevel(t *testing.T) {
-	raw := `[{"heading":{"level":"heading-2","text":"一、背景"},"blockType":"heading","index":0,"id":"m1"},` +
-		`{"paragraph":{"text":"公司在快速扩张"},"blockType":"paragraph","index":1,"id":"m2"},` +
-		`{"heading":{"level":3,"text":"数字形态"},"blockType":"heading","index":2,"id":"m3"}]`
-	blocks, err := extractBlocks(json.RawMessage(raw))
-	if err != nil {
-		t.Fatalf("extractBlocks: %v", err)
-	}
-	md, err := blocksToMarkdown(blocks)
-	if err != nil {
-		t.Fatalf("blocksToMarkdown: %v", err)
-	}
-	want := "## 一、背景\n\n公司在快速扩张\n\n### 数字形态\n"
-	if string(md) != want {
-		t.Fatalf("markdown mismatch:\n got=%q\nwant=%q", string(md), want)
-	}
-}
-
-func TestResourceTypeFor(t *testing.T) {
-	if got := resourceTypeFor(wikiNode{Category: CategoryALIDOC}); got != "document" {
-		t.Fatalf("ALIDOC should be document, got %q", got)
-	}
-	if got := resourceTypeFor(wikiNode{Category: "FILE", HasChildren: true}); got != "folder" {
-		t.Fatalf("hasChildren should be folder, got %q", got)
-	}
-	if got := resourceTypeFor(wikiNode{Category: "FILE"}); got != "file" {
-		t.Fatalf("plain file expected, got %q", got)
-	}
-}
-
-func TestBlockElementJSONShape(t *testing.T) {
-	// Lock the wire contract: discriminator + same-named property key.
-	raw := `{"blockType":"heading","heading":{"text":"T","level":2},"id":"b1","index":3}`
-	var b blockElement
-	if err := json.Unmarshal([]byte(raw), &b); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if b.BlockType != "heading" || b.Heading == nil || b.Heading.Level != 2 || b.Index != 3 {
-		t.Fatalf("unexpected decoded block: %+v", b)
-	}
-}
-
-func TestClientImplementsInterfaces(t *testing.T) {
-	// The connector must satisfy both the base and streaming interfaces; the
-	// service dispatches to FetchStream only if this assertion holds.
-	var _ datasource.Connector = (*Connector)(nil)
-	var _ datasource.StreamingConnector = (*Connector)(nil)
-}
-
-func TestBareDocIDRoundTrip(t *testing.T) {
-	const uuid = "mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"
-	if got := makeBareDocID(uuid); got != "doc:"+uuid {
-		t.Fatalf("makeBareDocID = %q", got)
-	}
-	if got := bareDocID(makeBareDocID(uuid)); got != uuid {
-		t.Fatalf("bareDocID round trip = %q", got)
-	}
-	// Knowledge-base resource IDs must not be mistaken for bare docs.
-	for _, rid := range []string{"", "doc:", "By8jQSoKDj1drD0M", "By8jQSoKDj1drD0M/nodeID"} {
-		if got := bareDocID(rid); got != "" {
-			t.Fatalf("bareDocID(%q) = %q, want empty", rid, got)
-		}
-	}
-}
-
-// The three URL shapes observed in the wild: a personal doc on docs.dingtalk.com,
-// a sheet-style doc with a heavy query string, and a wiki node URL with utm
-// parameters. All must yield the dentryUuid after /nodes/.
-func TestDentryUUIDFromURL_RealWorldSamples(t *testing.T) {
-	cases := []struct{ url, want string }{
-		{"https://docs.dingtalk.com/i/nodes/mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p", "mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"},
-		{"https://docs.dingtalk.com/i/nodes/b9Y4gmKWrPz5zbOBijEDl1qyJGXn6lpz?iframeQuery=entrance%3Ddata%26sheetId%3DhERWDMS%26viewId%3DqvGDAH2", "b9Y4gmKWrPz5zbOBijEDl1qyJGXn6lpz"},
-		{"https://alidocs.dingtalk.com/i/nodes/PwkYGxZV3ZmjmynKu3rbRRNEWAgozOKL?utm_scene=team_space", "PwkYGxZV3ZmjmynKu3rbRRNEWAgozOKL"},
-	}
-	for _, tc := range cases {
-		if got := dentryUUIDFromURL(tc.url); got != tc.want {
-			t.Fatalf("dentryUUIDFromURL(%q) = %q, want %q", tc.url, got, tc.want)
-		}
-	}
-}
-
-func TestCursorDocHashesRoundTrip(t *testing.T) {
-	c := &ddCursor{
-		DocHashes: map[string]string{"mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p": "abc123"},
-	}
-	decoded := decodeCursor(encodeCursor(c))
-	if got := decoded.DocHashes["mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"]; got != "abc123" {
-		t.Fatalf("doc hash lost in round trip: %+v", decoded.DocHashes)
-	}
-	if decoded.DocHashes == nil {
-		t.Fatal("decoded.DocHashes must be non-nil")
-	}
-}
-
-func TestDocTitleFromBlocks(t *testing.T) {
-	blocks := []blockElement{
-		{BlockType: "paragraph", Paragraph: &paragraphProps{Text: "正文"}},
-		{BlockType: "heading", Heading: &headingProps{Text: "第一个标题"}},
-	}
-	if got := docTitleFromBlocks(blocks, "someKey123"); got != "第一个标题" {
-		t.Fatalf("title = %q, want first heading", got)
-	}
-	if got := docTitleFromBlocks(nil, "mweZ92PV6MYXYy09FqZm2dgMWxEKBD6p"); got != "钉钉文档 mweZ92PV" {
-		t.Fatalf("fallback title = %q", got)
-	}
-}
-
-func TestApiStatusError(t *testing.T) {
-	e := &apiStatusError{Status: 404, Body: `{"code":"not.found"}`}
-	if got := e.Error(); got != `dingtalk API error status=404 body={"code":"not.found"}` {
-		t.Fatalf("unexpected message %q", got)
+	if err := testConnector(api).Validate(context.Background(), testConfig()); err == nil {
+		t.Fatal("Validate() error = nil, want node access failure")
 	}
 }

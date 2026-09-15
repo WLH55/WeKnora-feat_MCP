@@ -1,443 +1,503 @@
+// Package dingtalk implements the DingTalk document data source connector.
 package dingtalk
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
-	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
 )
 
 const (
-	defaultTimeout     = 30 * time.Second
-	userAgent          = "WeKnora-DingTalk-Connector/1.0"
-	maxResponseBytes   = 8 << 20 // 8 MiB guard against oversized bodies
-	maxListPageSize    = 50      // /v2.0/wiki/nodes caps maxResults at 50
-	maxWorkspacePage   = 30      // /v2.0/wiki/workspaces caps maxResults at 30
-	tokenRefreshSafety = 2 * time.Minute
+	apiBaseURL       = "https://api.dingtalk.com"
+	apiTimeout       = 30 * time.Second
+	maxResponseBytes = 16 << 20
+	maxPages         = 1000
+	maxAttempts      = 3
 )
 
-// client wraps the DingTalk open-platform API.
-//
-// Two credential families are needed: the new-style accessToken for
-// api.dingtalk.com (/v1.0, /v2.0) and the legacy access_token for
-// oapi.dingtalk.com (contact endpoints). They are obtained and cached
-// separately; whether the new token also works against the legacy host is
-// not documented, so the connector does not rely on it (spec R2).
+type config struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	OperatorID   string `json:"operator_id"`
+}
+
+func parseConfig(dataSourceConfig *types.DataSourceConfig) (*config, error) {
+	if dataSourceConfig == nil {
+		return nil, fmt.Errorf("%w: config is nil", datasource.ErrInvalidConfig)
+	}
+
+	raw, err := json.Marshal(dataSourceConfig.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("%w: marshal DingTalk credentials: %v",
+			datasource.ErrInvalidCredentials, err)
+	}
+	var cfg config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("%w: decode DingTalk credentials: %v",
+			datasource.ErrInvalidCredentials, err)
+	}
+	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
+	cfg.ClientSecret = strings.TrimSpace(cfg.ClientSecret)
+	cfg.OperatorID = strings.TrimSpace(cfg.OperatorID)
+
+	switch {
+	case cfg.ClientID == "":
+		return nil, fmt.Errorf("%w: client_id is required", datasource.ErrInvalidCredentials)
+	case cfg.ClientSecret == "":
+		return nil, fmt.Errorf("%w: client_secret is required", datasource.ErrInvalidCredentials)
+	case cfg.OperatorID == "":
+		return nil, fmt.Errorf("%w: operator_id is required", datasource.ErrInvalidCredentials)
+	}
+	return &cfg, nil
+}
+
+type workspace struct {
+	ID           string `json:"workspaceId"`
+	RootNodeID   string `json:"rootNodeId"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	URL          string `json:"url"`
+	ModifiedTime string `json:"modifiedTime"`
+}
+
+type node struct {
+	ID                string `json:"nodeId"`
+	WorkspaceID       string `json:"workspaceId"`
+	Name              string `json:"name"`
+	Type              string `json:"type"`
+	Category          string `json:"category"`
+	Extension         string `json:"extension"`
+	URL               string `json:"url"`
+	ModifiedTime      string `json:"modifiedTime"`
+	ModifiedTimestamp int64  `json:"modifiedTimestamp"`
+	HasChildren       bool   `json:"hasChildren"`
+}
+
+func (n node) isFolder() bool {
+	return strings.EqualFold(n.Type, "FOLDER")
+}
+
+func (n node) isDocument() bool {
+	return strings.EqualFold(n.Type, "FILE") &&
+		strings.EqualFold(n.Category, "ALIDOC") &&
+		strings.EqualFold(n.Extension, "adoc")
+}
+
+func (n node) title() string {
+	if title := strings.TrimSpace(n.Name); title != "" {
+		return title
+	}
+	return n.ID
+}
+
+func (n node) revision() string {
+	// Prefer the millisecond timestamp when present. Official node listings
+	// also return modifiedTime at minute precision (e.g. 2023-05-15T11:29Z),
+	// which would skip same-minute edits during incremental sync.
+	if n.ModifiedTimestamp > 0 {
+		return strconv.FormatInt(n.ModifiedTimestamp, 10)
+	}
+	return strings.TrimSpace(n.ModifiedTime)
+}
+
+func (n node) modifiedAt() time.Time {
+	if n.ModifiedTimestamp > 0 {
+		return time.UnixMilli(n.ModifiedTimestamp)
+	}
+	return parseDingTalkTime(n.ModifiedTime)
+}
+
+type dingTalkAPI interface {
+	listWorkspaces(context.Context) ([]workspace, error)
+	listNodes(context.Context, string) ([]node, error)
+	documentBlocks(context.Context, string) ([]json.RawMessage, error)
+}
+
 type client struct {
-	cfg      *Config
-	apiBase  string
-	oapiBase string
-	http     *http.Client
+	baseURL   string
+	operator  string
+	appKey    string
+	appSecret string
+	http      *http.Client
+	sleep     func(context.Context, time.Duration) error
 
-	mu              sync.Mutex
-	apiToken        string
-	apiTokenExpiry  time.Time
-	oapiAccessToken string
-	oapiTokenExpiry time.Time
-	// operatorID caches the unionId resolved from OperatorMobile. It is a
-	// one-time lookup: the mobile is static configuration, not per-request.
-	operatorID string
+	token       string
+	tokenExpiry time.Time
 }
 
-func newClient(cfg *Config) *client {
+func newClient(cfg *config) *client {
 	return &client{
-		cfg:      cfg,
-		apiBase:  cfg.GetAPIBaseURL(),
-		oapiBase: cfg.GetOAPIBaseURL(),
-		http:     datasource.NewConnectorHTTPClient(defaultTimeout),
+		baseURL:   apiBaseURL,
+		operator:  cfg.OperatorID,
+		appKey:    cfg.ClientID,
+		appSecret: cfg.ClientSecret,
+		http:      datasource.NewConnectorHTTPClient(apiTimeout),
+		sleep:     sleepContext,
 	}
 }
 
-// --- token management ---
+type accessTokenResponse struct {
+	AccessToken string `json:"accessToken"`
+	ExpireIn    int64  `json:"expireIn"`
+}
 
-// accessToken returns a cached open-platform accessToken, refreshing it when
-// it is missing or about to expire.
 func (c *client) accessToken(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	if c.apiToken != "" && time.Now().Before(c.apiTokenExpiry) {
-		token := c.apiToken
-		c.mu.Unlock()
-		return token, nil
+	if c.token != "" && time.Now().Before(c.tokenExpiry) {
+		return c.token, nil
 	}
-	c.mu.Unlock()
 
-	body, err := json.Marshal(map[string]string{
-		"appKey":    c.cfg.AppKey,
-		"appSecret": c.cfg.AppSecret,
-	})
+	var response accessTokenResponse
+	err := c.doJSON(ctx, http.MethodPost, "/v1.0/oauth2/accessToken", map[string]string{
+		"appKey":    c.appKey,
+		"appSecret": c.appSecret,
+	}, false, &response)
 	if err != nil {
-		return "", fmt.Errorf("marshal token request: %w", err)
+		return "", fmt.Errorf("get DingTalk access token: %w", err)
 	}
-	var resp accessTokenResponse
-	if err := c.do(ctx, http.MethodPost, c.apiBase+"/v1.0/oauth2/accessToken",
-		map[string]string{"Content-Type": "application/json"}, body, &resp); err != nil {
-		return "", fmt.Errorf("obtain accessToken: %w", err)
+	response.AccessToken = strings.TrimSpace(response.AccessToken)
+	if response.AccessToken == "" {
+		return "", fmt.Errorf("%w: DingTalk returned an empty access token", datasource.ErrInvalidCredentials)
 	}
-	if resp.AccessToken == "" {
-		return "", fmt.Errorf("obtain accessToken: empty token in response")
-	}
-	ttl := time.Duration(resp.ExpireIn) * time.Second
+
+	ttl := time.Duration(response.ExpireIn) * time.Second
 	if ttl <= 0 {
-		ttl = 2 * time.Hour
+		ttl = 90 * time.Minute
 	}
-
-	c.mu.Lock()
-	c.apiToken = resp.AccessToken
-	c.apiTokenExpiry = time.Now().Add(ttl - tokenRefreshSafety)
-	c.mu.Unlock()
-	return resp.AccessToken, nil
+	if ttl > 5*time.Minute {
+		ttl -= 5 * time.Minute
+	}
+	c.token = response.AccessToken
+	c.tokenExpiry = time.Now().Add(ttl)
+	return c.token, nil
 }
 
-// oapiToken returns a cached legacy access_token for oapi.dingtalk.com.
-func (c *client) oapiToken(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	if c.oapiAccessToken != "" && time.Now().Before(c.oapiTokenExpiry) {
-		token := c.oapiAccessToken
-		c.mu.Unlock()
-		return token, nil
-	}
-	c.mu.Unlock()
-
-	q := url.Values{}
-	q.Set("appkey", c.cfg.AppKey)
-	q.Set("appsecret", c.cfg.AppSecret)
-	var resp oapiTokenResponse
-	if err := c.do(ctx, http.MethodGet, c.oapiBase+"/gettoken?"+q.Encode(), nil, nil, &resp); err != nil {
-		return "", fmt.Errorf("obtain oapi access_token: %w", err)
-	}
-	if resp.ErrCode != 0 {
-		return "", fmt.Errorf("obtain oapi access_token: errcode=%d errmsg=%s", resp.ErrCode, resp.ErrMsg)
-	}
-	if resp.AccessToken == "" {
-		return "", fmt.Errorf("obtain oapi access_token: empty token in response")
-	}
-	ttl := time.Duration(resp.ExpiresIn) * time.Second
-	if ttl <= 0 {
-		ttl = 2 * time.Hour
-	}
-
-	c.mu.Lock()
-	c.oapiAccessToken = resp.AccessToken
-	c.oapiTokenExpiry = time.Now().Add(ttl - tokenRefreshSafety)
-	c.mu.Unlock()
-	return resp.AccessToken, nil
-}
-
-// resolveOperatorID resolves the configured mobile number to a unionId, which
-// every Wiki/storage endpoint requires as `operatorId`. The result is cached
-// for the lifetime of the client.
-func (c *client) resolveOperatorID(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	if c.operatorID != "" {
-		id := c.operatorID
-		c.mu.Unlock()
-		return id, nil
-	}
-	c.mu.Unlock()
-
-	token, err := c.oapiToken(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	userID, err := c.getUserIDByMobile(ctx, token, c.cfg.OperatorMobile)
-	if err != nil {
-		return "", err
-	}
-	unionID, err := c.getUnionIDByUserID(ctx, token, userID)
-	if err != nil {
-		return "", err
-	}
-	if unionID == "" {
-		return "", fmt.Errorf("resolve operator: user %q has no unionId", userID)
-	}
-
-	c.mu.Lock()
-	c.operatorID = unionID
-	c.mu.Unlock()
-	return unionID, nil
-}
-
-// getUserIDByMobile maps a phone number to an in-service employee's userId.
-// DingTalk only resolves active employees; a departed employee returns an error.
-func (c *client) getUserIDByMobile(ctx context.Context, token, mobile string) (string, error) {
-	form := url.Values{}
-	form.Set("access_token", token)
-	form.Set("mobile", mobile)
-	var resp oapiGetUserByMobileResponse
-	if err := c.do(ctx, http.MethodPost, c.oapiBase+"/topapi/v2/user/getbymobile",
-		map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, []byte(form.Encode()), &resp); err != nil {
-		return "", fmt.Errorf("query user by mobile: %w", err)
-	}
-	if resp.ErrCode != 0 {
-		return "", fmt.Errorf("query user by mobile: errcode=%d errmsg=%s (is the number an active employee?)",
-			resp.ErrCode, resp.ErrMsg)
-	}
-	if resp.Result.UserID == "" {
-		return "", fmt.Errorf("query user by mobile: empty userId for %s", mobile)
-	}
-	return resp.Result.UserID, nil
-}
-
-// getUnionIDByUserID maps a userId to its org-scoped unionId.
-func (c *client) getUnionIDByUserID(ctx context.Context, token, userID string) (string, error) {
-	form := url.Values{}
-	form.Set("access_token", token)
-	form.Set("userid", userID)
-	var resp oapiGetUserDetailResponse
-	if err := c.do(ctx, http.MethodPost, c.oapiBase+"/topapi/v2/user/get",
-		map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, []byte(form.Encode()), &resp); err != nil {
-		return "", fmt.Errorf("query user detail: %w", err)
-	}
-	if resp.ErrCode != 0 {
-		return "", fmt.Errorf("query user detail: errcode=%d errmsg=%s", resp.ErrCode, resp.ErrMsg)
-	}
-	return resp.Result.UnionID, nil
-}
-
-// --- knowledge base API ---
-
-// listWorkspaces returns one page of knowledge bases visible to operatorID.
-func (c *client) listWorkspaces(ctx context.Context, operatorID, nextToken string) ([]workspace, string, error) {
-	token, err := c.accessToken(ctx)
-	if err != nil {
-		return nil, "", err
-	}
-	q := url.Values{}
-	q.Set("operatorId", operatorID)
-	q.Set("maxResults", fmt.Sprintf("%d", maxWorkspacePage))
-	if nextToken != "" {
-		q.Set("nextToken", nextToken)
-	}
-	var resp workspaceListResponse
-	if err := c.do(ctx, http.MethodGet, c.apiBase+"/v2.0/wiki/workspaces?"+q.Encode(),
-		c.authHeader(token), nil, &resp); err != nil {
-		return nil, "", err
-	}
-	return resp.Workspaces, resp.NextToken, nil
-}
-
-// listAllWorkspaces pages through every knowledge base visible to operatorID.
-func (c *client) listAllWorkspaces(ctx context.Context, operatorID string) ([]workspace, error) {
-	var all []workspace
-	next := ""
-	for {
-		page, token, err := c.listWorkspaces(ctx, operatorID, next)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, page...)
-		if token == "" || len(page) == 0 {
-			return all, nil
-		}
-		next = token
-	}
-}
-
-// listNodes returns one page of direct children of parentNodeID.
-func (c *client) listNodes(ctx context.Context, operatorID, parentNodeID, nextToken string) ([]wikiNode, string, error) {
-	token, err := c.accessToken(ctx)
-	if err != nil {
-		return nil, "", err
-	}
-	q := url.Values{}
-	q.Set("parentNodeId", parentNodeID)
-	q.Set("operatorId", operatorID)
-	q.Set("maxResults", fmt.Sprintf("%d", maxListPageSize))
-	if nextToken != "" {
-		q.Set("nextToken", nextToken)
-	}
-	var resp nodeListResponse
-	if err := c.do(ctx, http.MethodGet, c.apiBase+"/v2.0/wiki/nodes?"+q.Encode(),
-		c.authHeader(token), nil, &resp); err != nil {
-		return nil, "", err
-	}
-	return resp.Nodes, resp.NextToken, nil
-}
-
-// listAllNodes pages through every direct child of parentNodeID.
-func (c *client) listAllNodes(ctx context.Context, operatorID, parentNodeID string) ([]wikiNode, error) {
-	var all []wikiNode
-	next := ""
-	for {
-		page, token, err := c.listNodes(ctx, operatorID, parentNodeID, next)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, page...)
-		if token == "" || len(page) == 0 {
-			return all, nil
-		}
-		next = token
-	}
-}
-
-// queryBlocks returns the first-level block elements of an online document.
-// DingTalk returns only top-level blocks; nested blocks (table rows/cells,
-// callout children) are handled defensively downstream.
-func (c *client) queryBlocks(ctx context.Context, operatorID, docKey string) ([]blockElement, error) {
-	token, err := c.accessToken(ctx)
-	if err != nil {
-		return nil, err
-	}
-	q := url.Values{}
-	if operatorID != "" {
-		q.Set("operatorId", operatorID)
-	}
-	base := c.apiBase + "/v1.0/doc/suites/documents/" + url.PathEscape(docKey) + "/blocks"
-	if enc := q.Encode(); enc != "" {
-		base += "?" + enc
-	}
-	var resp blocksResponse
-	if err := c.do(ctx, http.MethodGet, base, c.authHeader(token), nil, &resp); err != nil {
-		return nil, err
-	}
-	return extractBlocks(resp.Result)
-}
-
-// apiStatusError carries the HTTP status of a non-2xx DingTalk response so
-// callers can distinguish "document gone" (404) from "no permission" (403)
-// without string matching. The message keeps the historical format.
-type apiStatusError struct {
-	Status int
-	Body   string
-}
-
-func (e *apiStatusError) Error() string {
-	return fmt.Sprintf("dingtalk API error status=%d body=%s", e.Status, e.Body)
-}
-
-// authHeader builds the header map for open-platform calls.
-func (c *client) authHeader(token string) map[string]string {
-	return map[string]string{
-		"x-acs-dingtalk-access-token": token,
-		"Content-Type":                "application/json",
-	}
-}
-
-// --- HTTP plumbing ---
-
-// do executes an HTTP request with retries for transient failures (transport
-// errors, 429, 5xx) and decodes a JSON response into out. body is re-created
-// per attempt so retries are safe, and the request body is never logged.
-func (c *client) do(
+func (c *client) doJSON(
 	ctx context.Context,
-	method, rawURL string,
-	headers map[string]string,
-	body []byte,
-	out interface{},
+	method, path string,
+	requestBody any,
+	authenticated bool,
+	result any,
 ) error {
-	backoff := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
-	maxRetries := len(backoff)
-
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		var reader io.Reader
-		if body != nil {
-			reader = bytes.NewReader(body)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
+	var payload []byte
+	var err error
+	if requestBody != nil {
+		payload, err = json.Marshal(requestBody)
 		if err != nil {
-			return fmt.Errorf("create request: %w", err)
+			return fmt.Errorf("encode DingTalk request: %w", err)
 		}
-		for k, v := range headers {
-			req.Header.Set(k, v)
+	}
+
+	refreshed := false
+	retryAttempt := 0
+	for {
+		var body io.Reader
+		if payload != nil {
+			body = bytes.NewReader(payload)
 		}
-		req.Header.Set("User-Agent", userAgent)
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+		if err != nil {
+			return fmt.Errorf("create DingTalk request: %w", err)
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+
+		var token string
+		if authenticated {
+			token, err = c.accessToken(ctx)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("x-acs-dingtalk-access-token", token)
+		}
 
 		resp, err := c.http.Do(req)
 		if err != nil {
-			lastErr = fmt.Errorf("execute request: %w", err)
-			if attempt < maxRetries {
-				if sErr := sleepCtx(ctx, backoff[attempt]); sErr != nil {
-					return sErr
+			requestErr := redactRequestError(err)
+			if retryAttempt+1 < maxAttempts && !isContextError(requestErr) {
+				delay := retryDelay(retryAttempt)
+				retryAttempt++
+				if err := c.wait(ctx, delay); err != nil {
+					return err
 				}
 				continue
 			}
-			return lastErr
+			return fmt.Errorf("execute DingTalk request: %w", requestErr)
 		}
 
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-		resp.Body.Close()
+		responseBody, readErr := readBody(resp.Body)
+		_ = resp.Body.Close()
 		if readErr != nil {
-			lastErr = fmt.Errorf("read response: %w", readErr)
-			if attempt < maxRetries {
-				if sErr := sleepCtx(ctx, backoff[attempt]); sErr != nil {
-					return sErr
+			return fmt.Errorf("read DingTalk response: %w", readErr)
+		}
+
+		if authenticated && resp.StatusCode == http.StatusUnauthorized && !refreshed {
+			if c.token == token {
+				c.token = ""
+				c.tokenExpiry = time.Time{}
+			}
+			refreshed = true
+			continue
+		}
+
+		if isTransient(resp.StatusCode) {
+			apiErr := c.redactAPIError(decodeAPIError(resp.StatusCode, responseBody))
+			if retryAttempt+1 < maxAttempts {
+				delay := retryDelay(retryAttempt)
+				if resp.StatusCode == http.StatusTooManyRequests {
+					delay = parseRetryAfter(resp.Header.Get("Retry-After"), delay)
+				}
+				retryAttempt++
+				if err := c.wait(ctx, delay); err != nil {
+					return err
 				}
 				continue
 			}
-			return lastErr
+			return apiErr
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("dingtalk API transient status=%d body=%s", resp.StatusCode, truncate(string(data), 300))
-			if attempt < maxRetries {
-				logger.Warnf(ctx, "[DingTalk] %s %s attempt %d/%d: %v", method, redactURL(rawURL), attempt+1, maxRetries+1, lastErr)
-				if sErr := sleepCtx(ctx, backoff[attempt]); sErr != nil {
-					return sErr
-				}
-				continue
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			apiErr := c.redactAPIError(decodeAPIError(resp.StatusCode, responseBody))
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				return fmt.Errorf("%w: %w", datasource.ErrInvalidCredentials, apiErr)
 			}
-			return lastErr
+			return apiErr
 		}
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return &apiStatusError{Status: resp.StatusCode, Body: truncate(string(data), 500)}
-		}
-
-		if out == nil {
-			return nil
-		}
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode response: %w body=%s", err, truncate(string(data), 300))
+		if result != nil && len(responseBody) > 0 {
+			if err := json.Unmarshal(responseBody, result); err != nil {
+				return fmt.Errorf("decode DingTalk response: %w", err)
+			}
 		}
 		return nil
 	}
-	return lastErr
 }
 
-// extractBlocks decodes the `result` payload of the blocks endpoint into a
-// block slice. The exact envelope is not documented, so several plausible
-// shapes are accepted:
-//
-//	[ {...}, ... ]                       — result is the array
-//	{ "blocks": [...] }                  — result is an object wrapping an array
-//	{ "data": [...] } / { "data": {"blocks": [...]} } — nested variants
-func extractBlocks(raw json.RawMessage) ([]blockElement, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil, nil
-	}
-	var direct []blockElement
-	if err := json.Unmarshal(raw, &direct); err == nil {
-		return direct, nil
-	}
-	var wrapper struct {
-		Blocks []blockElement  `json:"blocks"`
-		Data   json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &wrapper); err == nil {
-		if len(wrapper.Blocks) > 0 {
-			return wrapper.Blocks, nil
-		}
-		if len(wrapper.Data) > 0 {
-			return extractBlocks(wrapper.Data)
+func (c *client) redactAPIError(err error) error {
+	message := err.Error()
+	for _, sensitive := range []string{c.appKey, c.appSecret, c.operator, c.token} {
+		if sensitive != "" {
+			message = strings.ReplaceAll(message, sensitive, "[REDACTED]")
 		}
 	}
-	return nil, fmt.Errorf("decode blocks: unrecognized result shape: %s", truncate(string(raw), 200))
+	return errors.New(message)
 }
 
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
+func (c *client) listWorkspaces(ctx context.Context) ([]workspace, error) {
+	var all []workspace
+	nextToken := ""
+	seenTokens := make(map[string]struct{})
+
+	for page := 0; page < maxPages; page++ {
+		query := url.Values{
+			"maxResults": {"30"},
+			"operatorId": {c.operator},
+		}
+		if nextToken != "" {
+			query.Set("nextToken", nextToken)
+		}
+		var response struct {
+			Workspaces []workspace `json:"workspaces"`
+			NextToken  string      `json:"nextToken"`
+		}
+		if err := c.doJSON(
+			ctx, http.MethodGet, "/v2.0/wiki/workspaces?"+query.Encode(), nil, true, &response,
+		); err != nil {
+			return nil, fmt.Errorf("list DingTalk workspaces: %w", err)
+		}
+		all = append(all, response.Workspaces...)
+		nextToken = strings.TrimSpace(response.NextToken)
+		if nextToken == "" {
+			return all, nil
+		}
+		if _, exists := seenTokens[nextToken]; exists {
+			return nil, errors.New("DingTalk workspace pagination repeated nextToken")
+		}
+		seenTokens[nextToken] = struct{}{}
+	}
+	return nil, fmt.Errorf("DingTalk workspace pagination exceeded %d pages", maxPages)
+}
+
+func (c *client) listNodes(ctx context.Context, parentNodeID string) ([]node, error) {
+	var all []node
+	nextToken := ""
+	seenTokens := make(map[string]struct{})
+
+	for page := 0; page < maxPages; page++ {
+		query := url.Values{
+			"maxResults":   {"50"},
+			"operatorId":   {c.operator},
+			"parentNodeId": {parentNodeID},
+		}
+		if nextToken != "" {
+			query.Set("nextToken", nextToken)
+		}
+		var response struct {
+			Nodes     []node `json:"nodes"`
+			NextToken string `json:"nextToken"`
+		}
+		if err := c.doJSON(
+			ctx, http.MethodGet, "/v2.0/wiki/nodes?"+query.Encode(), nil, true, &response,
+		); err != nil {
+			return nil, fmt.Errorf("list DingTalk nodes: %w", err)
+		}
+		all = append(all, response.Nodes...)
+		nextToken = strings.TrimSpace(response.NextToken)
+		if nextToken == "" {
+			return all, nil
+		}
+		if _, exists := seenTokens[nextToken]; exists {
+			return nil, errors.New("DingTalk node pagination repeated nextToken")
+		}
+		seenTokens[nextToken] = struct{}{}
+	}
+	return nil, fmt.Errorf("DingTalk node pagination exceeded %d pages", maxPages)
+}
+
+func (c *client) documentBlocks(ctx context.Context, documentID string) ([]json.RawMessage, error) {
+	const pageSize = 100
+	var all []json.RawMessage
+
+	for page := 0; page < maxPages; page++ {
+		start := page * pageSize
+		query := url.Values{
+			"endIndex":   {strconv.Itoa(start + pageSize - 1)},
+			"operatorId": {c.operator},
+			"startIndex": {strconv.Itoa(start)},
+		}
+		var response struct {
+			Success *bool `json:"success"`
+			Result  *struct {
+				Data []json.RawMessage `json:"data"`
+			} `json:"result"`
+		}
+		path := "/v1.0/doc/suites/documents/" + url.PathEscape(documentID) +
+			"/blocks?" + query.Encode()
+		if err := c.doJSON(ctx, http.MethodGet, path, nil, true, &response); err != nil {
+			return nil, fmt.Errorf("query DingTalk document blocks: %w", err)
+		}
+		if response.Success == nil || !*response.Success || response.Result == nil {
+			return nil, errors.New("DingTalk document blocks request was unsuccessful")
+		}
+		all = append(all, response.Result.Data...)
+		if len(response.Result.Data) < pageSize {
+			return all, nil
+		}
+	}
+	return nil, fmt.Errorf("DingTalk document block pagination exceeded %d pages", maxPages)
+}
+
+type apiError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e *apiError) Error() string {
+	switch {
+	case e.code != "" && e.message != "":
+		return fmt.Sprintf("DingTalk API status=%d code=%s message=%s", e.status, e.code, e.message)
+	case e.code != "":
+		return fmt.Sprintf("DingTalk API status=%d code=%s", e.status, e.code)
+	default:
+		return fmt.Sprintf("DingTalk API status=%d", e.status)
+	}
+}
+
+func decodeAPIError(status int, body []byte) error {
+	var response struct {
+		Code    json.RawMessage `json:"code"`
+		ErrCode json.RawMessage `json:"errcode"`
+		Message string          `json:"message"`
+		ErrMsg  string          `json:"errmsg"`
+	}
+	_ = json.Unmarshal(body, &response)
+	code := rawValue(response.Code)
+	if code == "" {
+		code = rawValue(response.ErrCode)
+	}
+	message := strings.TrimSpace(response.Message)
+	if message == "" {
+		message = strings.TrimSpace(response.ErrMsg)
+	}
+	return &apiError{status: status, code: code, message: message}
+}
+
+func rawValue(value json.RawMessage) string {
+	if len(value) == 0 || string(value) == "null" {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(value, &text); err == nil {
+		return strings.TrimSpace(text)
+	}
+	return strings.TrimSpace(string(value))
+}
+
+func readBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxResponseBytes {
+		return nil, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
+	}
+	return data, nil
+}
+
+func isTransient(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 4 {
+		attempt = 4
+	}
+	return time.Duration(1<<attempt) * 250 * time.Millisecond
+}
+
+func parseRetryAfter(value string, fallback time.Duration) time.Duration {
+	const maximum = 30 * time.Second
+	delay := fallback
+	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && value != "" {
+		if seconds <= 0 {
+			delay = 100 * time.Millisecond
+		} else {
+			delay = time.Duration(seconds) * time.Second
+		}
+	} else if parsed, err := http.ParseTime(value); err == nil {
+		delay = time.Until(parsed)
+		if delay <= 0 {
+			delay = 100 * time.Millisecond
+		}
+	}
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func (c *client) wait(ctx context.Context, delay time.Duration) error {
+	if c.sleep == nil {
+		return sleepContext(ctx, delay)
+	}
+	return c.sleep(ctx, delay)
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -447,26 +507,18 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func truncate(s string, max int) string {
-	if max <= 0 || len(s) <= max {
-		return s
-	}
-	return s[:max] + "...(truncated)"
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// redactURL removes query values (which may carry access_token) from a URL for
-// logging. The path alone is enough to identify the call.
-func redactURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "(unparsable url)"
-	}
-	if u.RawQuery != "" {
-		keys := make([]string, 0, 4)
-		for k := range u.Query() {
-			keys = append(keys, k)
+func redactRequestError(err error) error {
+	for {
+		var requestErr *url.Error
+		if !errors.As(err, &requestErr) || requestErr.Err == nil {
+			return err
 		}
-		u.RawQuery = "?" + strings.Join(keys, "&") + "=<redacted>"
+		// url.Error includes the full request URL. DingTalk puts operatorId in
+		// the query string, so retain the cause without persisting that ID.
+		err = requestErr.Err
 	}
-	return u.String()
 }

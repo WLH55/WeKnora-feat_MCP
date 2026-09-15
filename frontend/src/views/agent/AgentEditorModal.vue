@@ -3,6 +3,9 @@
     <Transition name="modal">
       <div v-if="visible" class="settings-overlay" @click.self="handleClose">
         <div class="settings-modal">
+          <div v-if="editorInitializing" class="editor-initializing" role="status" :aria-label="$t('common.loading')">
+            <t-loading size="medium" :text="$t('common.loading')" />
+          </div>
           <!-- 关闭按钮 -->
           <button class="close-btn" @click="handleClose" :aria-label="$t('common.close')">
             <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
@@ -216,6 +219,7 @@
                             class="required">*</span></label>
                         <p class="desc">{{ $t('agentEditor.desc.systemPrompt') }}{{ isBuiltinAgent ?
                           $t('agentEditor.desc.leaveEmptyDefault') : '' }}</p>
+                        <p class="desc">{{ $t('agentEditor.desc.promptInheritance') }}</p>
                         <div class="placeholder-tags">
                           <span class="placeholder-label">{{ $t('agentEditor.placeholders.available') }}</span>
                           <t-tooltip v-for="placeholder in availablePlaceholders" :key="placeholder.name"
@@ -703,14 +707,19 @@
                       </div>
                     </div>
 
-                    <!-- 最大迭代次数（Agent 模式） -->
+                    <!-- 最大迭代次数（Agent 模式）：正数为上限，-1 为不限制 -->
                     <div v-if="isAgentMode" class="setting-row">
                       <div class="setting-info">
                         <label>{{ $t('agent.editor.maxIterations') }}</label>
                         <p class="desc">{{ $t('agentEditor.desc.maxIterations') }}</p>
                       </div>
-                      <div class="setting-control">
-                        <t-input-number v-model="formData.config.max_iterations" :min="1" :max="50" theme="column" />
+                      <div class="setting-control max-tokens-control">
+                        <t-radio-group v-model="maxIterationsMode">
+                          <t-radio-button value="limit">{{ $t('agent.editor.maxIterationsLimit') }}</t-radio-button>
+                          <t-radio-button value="unlimited">{{ $t('agent.editor.maxIterationsUnlimited') }}</t-radio-button>
+                        </t-radio-group>
+                        <t-input-number v-if="maxIterationsMode === 'limit'" v-model="formData.config.max_iterations"
+                          :min="2" :max="50" theme="column" />
                       </div>
                     </div>
 
@@ -1777,6 +1786,7 @@
                     $t('common.cancel')
                     }}</t-button>
                   <t-button v-if="!props.readOnly" theme="primary" data-guide="agent-create-submit" :loading="saving"
+                    :disabled="editorInitializing"
                     @click="handleSave">{{
                     saveButtonLabel
                     }}</t-button>
@@ -1824,6 +1834,7 @@ import {
 } from '@/config/contextualGuides';
 import { useI18n } from 'vue-i18n';
 import { selectInitialModelId } from '@/utils/modelDefaults';
+import { hydrateAgentPromptRefs, serializeAgentPrompts } from '@/utils/agentPromptTemplates';
 import { copyWithToast } from '@/utils/clipboard';
 import { MessagePlugin } from 'tdesign-vue-next';
 import {
@@ -2014,6 +2025,7 @@ onBeforeUnmount(() => {
 })
 
 const saving = ref(false);
+const editorInitializing = ref(false);
 const allModels = ref<ModelConfig[]>([]);
 const kbOptions = ref<{ label: string; value: string; type?: 'document' | 'faq'; count?: number; shared?: boolean; orgName?: string; ragEnabled?: boolean; wikiEnabled?: boolean; capabilities?: KBCapabilities }[]>([]);
 
@@ -2021,6 +2033,7 @@ const kbOptions = ref<{ label: string; value: string; type?: 'document' | 'faq';
 const agentTypePresets = ref<AgentTypePreset[]>([]);
 // Agent 系统提示词模板缓存（用于切换智能体类型时根据 system_prompt_id 解析出实际文本填入）
 const agentSystemPromptTemplates = ref<PromptTemplate[]>([]);
+const promptTemplates = ref<PromptTemplatesConfig | null>(null);
 const intentPromptTemplates = ref<PromptTemplate[]>([]);
 type McpSelectOption = { label: string; value: string; disabled?: boolean };
 
@@ -2347,7 +2360,7 @@ const defaultMaxCompletionTokensFor = (mode: string, sandboxConfigId?: string) =
 };
 
 // 知识库相关工具列表（用于 watch(hasKnowledgeBase) 从"无"变"有"时 seed 默认工具）
-const knowledgeBaseTools = ['grep_chunks', 'knowledge_search', 'list_knowledge_chunks', 'query_knowledge_graph', 'get_document_info', 'database_query'];
+const knowledgeBaseTools = ['grep_chunks', 'knowledge_search', 'list_knowledge_chunks', 'get_document_info'];
 
 // Wiki 读取类工具（用于 watch(agentMode) 切到 smart-reasoning 时 seed 默认工具）
 const wikiReadTools = ['wiki_search', 'wiki_read_page', 'wiki_read_source_doc', 'wiki_flag_issue'];
@@ -2877,6 +2890,22 @@ const maxCompletionTokensMode = computed({
   },
 });
 
+const lastFiniteMaxIterations = ref(10);
+const maxIterationsMode = computed({
+  get: () => (formData.value.config.max_iterations < 0 ? 'unlimited' : 'limit'),
+  set: (mode: 'limit' | 'unlimited') => {
+    if (mode === 'unlimited') {
+      if (formData.value.config.max_iterations > 1) {
+        lastFiniteMaxIterations.value = formData.value.config.max_iterations;
+      }
+      formData.value.config.max_iterations = -1;
+      return;
+    }
+    const restored = lastFiniteMaxIterations.value > 1 ? lastFiniteMaxIterations.value : 10;
+    formData.value.config.max_iterations = restored;
+  },
+});
+
 const currentIntentTemplate = computed(() =>
   intentPromptTemplates.value.find((template) => template.id === selectedIntent.value),
 );
@@ -3358,13 +3387,19 @@ const needsRerankModel = computed(() => {
   return false;
 });
 
+let editorInitializationGeneration = 0;
+
 // 监听可见性变化，重置表单
 watch(() => props.visible, async (val) => {
+  const generation = ++editorInitializationGeneration;
   if (val) {
+    editorInitializing.value = true;
+    try {
     savedAgent.value = null;
     currentSection.value = resolveEditorSection(props.initialSection);
     // 先加载依赖数据（包括默认配置）
     await loadDependencies();
+    if (generation !== editorInitializationGeneration || !props.visible) return;
 
     if (props.mode === 'edit' && props.agent) {
       // 深度复制对象以避免引用问题
@@ -3415,13 +3450,17 @@ watch(() => props.visible, async (val) => {
 
       // 兼容旧数据：如果没有 agent_mode 字段，根据 allowed_tools 推断
       if (!agentData.config.agent_mode) {
-        const isAgent = agentData.config.max_iterations > 1 || (agentData.config.allowed_tools && agentData.config.allowed_tools.length > 0);
+        const isAgent = agentData.config.max_iterations < 0 || agentData.config.max_iterations > 1 || (agentData.config.allowed_tools && agentData.config.allowed_tools.length > 0);
         agentData.config.agent_mode = isAgent ? 'smart-reasoning' : 'quick-answer';
       }
 
       // 设置初始化标志，防止 watch 自动添加工具
       isInitializing.value = true;
+      agentData.config = hydrateAgentPromptRefs(agentData.config, promptTemplates.value);
       formData.value = agentData;
+      if (agentData.config.max_iterations > 1) {
+        lastFiniteMaxIterations.value = agentData.config.max_iterations;
+      }
       // 初始化知识库选择模式
       initKbSelectionMode();
       initMcpSelectionMode();
@@ -3430,10 +3469,8 @@ watch(() => props.visible, async (val) => {
       nextTick(() => {
         isInitializing.value = false;
       });
-      // 内置智能体：如果提示词为空，填入系统默认值
-      if (agentData.is_builtin) {
-        fillBuiltinAgentDefaults();
-      }
+      // Display inherited defaults for all agents without persisting a copy.
+      fillBuiltinAgentDefaults();
       void loadAgentIntegrationCounts(agentData.id);
     } else {
       // 创建新智能体，使用系统默认值
@@ -3502,11 +3539,21 @@ watch(() => props.visible, async (val) => {
     }
 
     await syncInstalledSkills()
+    if (generation !== editorInitializationGeneration || !props.visible) return;
 
     if (props.initialHighlightField) {
       await applyInitialFieldHighlight(props.initialHighlightField);
+      if (generation !== editorInitializationGeneration || !props.visible) return;
+    }
+    } catch (error) {
+      console.error('Failed to initialize agent editor', error);
+    } finally {
+      if (generation === editorInitializationGeneration && props.visible) {
+        editorInitializing.value = false;
+      }
     }
   } else {
+    editorInitializing.value = false;
     clearFieldHighlight();
     agentIMChannelCount.value = 0;
     agentEmbedChannelCount.value = 0;
@@ -3674,21 +3721,14 @@ watch(agentMode, (val, _oldVal) => {
     if (formData.value.config.allowed_tools.length === 0) {
       const tools: string[] = [];
       if (hasRagKnowledgeBase.value) {
-        tools.push(
-          'knowledge_search',
-          'grep_chunks',
-          'list_knowledge_chunks',
-          'query_knowledge_graph',
-          'get_document_info',
-          'database_query',
-        );
+        tools.push(...knowledgeBaseTools);
       }
       if (hasWikiKnowledgeBase.value) {
         tools.push(...wikiReadTools);
       }
       formData.value.config.allowed_tools = tools;
     }
-    if (formData.value.config.max_iterations <= 1) {
+    if (formData.value.config.max_iterations >= 0 && formData.value.config.max_iterations <= 1) {
       formData.value.config.max_iterations = 10;
     }
     // 切换到 Agent 模式时，如果系统提示词是快速问答的默认值或为空，替换为 Agent 默认提示词
@@ -3786,6 +3826,12 @@ watch(() => uiStore.showSettingsModal, async (visible, prevVisible) => {
   }
 });
 
+watch(() => chatResources.allModels, (list) => {
+  if (props.visible) {
+    allModels.value = list;
+  }
+});
+
 const mapKbToOption = (kb: any, shared: boolean, orgName?: string) => {
   const strategy = kb.indexing_strategy;
   const caps: KBCapabilities | undefined = kb.capabilities;
@@ -3803,6 +3849,7 @@ const mapKbToOption = (kb: any, shared: boolean, orgName?: string) => {
 };
 
 const applyPromptTemplateDefaults = (cfg: PromptTemplatesConfig | null) => {
+  promptTemplates.value = cfg;
   if (!cfg) return;
   if (cfg.agent_system_prompt && Array.isArray(cfg.agent_system_prompt)) {
     agentSystemPromptTemplates.value = cfg.agent_system_prompt;
@@ -4637,6 +4684,7 @@ watch(() => props.visible, (val) => {
 // 模板选择处理函数
 const handleSystemPromptTemplateSelect = (template: PromptTemplate) => {
   formData.value.config.system_prompt = template.content;
+  formData.value.config.system_prompt_id = template.id;
 };
 
 // Agent 系统提示词的"恢复默认"：
@@ -4665,6 +4713,7 @@ const handleAgentSystemPromptResetDefault = (fallback: PromptTemplate) => {
 
 const handleContextTemplateSelect = (template: PromptTemplate) => {
   formData.value.config.context_template = template.content;
+  formData.value.config.context_template_id = template.id;
 };
 
 const handleRewriteTemplateSelect = (template: PromptTemplate) => {
@@ -4768,10 +4817,11 @@ const handleSave = async () => {
 
   pruneSelectedSkills()
 
+  const payload = { ...formData.value, config: serializeAgentPrompts(formData.value.config, promptTemplates.value) };
   saving.value = true;
   try {
     if (editorMode.value === 'create') {
-      const result: any = await createAgent(formData.value);
+      const result: any = await createAgent(payload);
       const created = result?.data as CustomAgent | undefined;
       if (!created?.id) {
         throw new Error(result?.message || t('agent.messages.saveFailed'));
@@ -4784,7 +4834,7 @@ const handleSave = async () => {
       MessagePlugin.success(t('agent.messages.created'));
       emit('success', created);
     } else {
-      await updateAgent(formData.value.id, formData.value);
+      await updateAgent(formData.value.id, payload);
       MessagePlugin.success(t('agent.messages.updated'));
       emit('success');
       handleClose();
@@ -4825,6 +4875,16 @@ const handleSave = async () => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.editor-initializing {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--td-bg-color-container);
 }
 
 .close-btn {

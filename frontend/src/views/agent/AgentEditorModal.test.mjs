@@ -7,7 +7,7 @@ const source = readFileSync(new URL('./AgentEditorModal.vue', import.meta.url), 
 test('editing an agent closes the editor after a successful save', () => {
   assert.match(
     source,
-    /await updateAgent\(formData\.value\.id, formData\.value\);\s*MessagePlugin\.success\(t\('agent\.messages\.updated'\)\);\s*emit\('success'\);\s*handleClose\(\);/
+    /await updateAgent\(formData\.value\.id, payload\);\s*MessagePlugin\.success\(t\('agent\.messages\.updated'\)\);\s*emit\('success'\);\s*handleClose\(\);/
   )
 })
 
@@ -146,6 +146,7 @@ test('agent skill picker uses the catalog and only enables ready installs', () =
   assert.match(source, /isSkillBusy/)
   assert.match(source, /viewInstallProgress/)
   assert.match(source, /openSkillInstallProgress/)
+  assert.doesNotMatch(source, /await openSkillInstallProgress\(skill\)/)
   assert.match(source, /SandboxSkillsPanel/)
   assert.match(source, /focus-skill-id/)
   assert.match(source, /skillsGroupUnavailable/)
