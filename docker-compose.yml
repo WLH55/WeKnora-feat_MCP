@@ -1,4 +1,4 @@
-﻿services:
+services:
   frontend:
     image: wechatopenai/weknora-ui:${WEKNORA_VERSION:-latest}
     # Requires frontend/dist — run ./scripts/build_frontend_dist.sh before --build
@@ -35,19 +35,21 @@
         - GOPROXY_ARG=${GOPROXY:-https://goproxy.cn,direct}
         - WITH_ANYDOC=${WITH_ANYDOC:-1}
     container_name: WeKnora-app
+    entrypoint: [ "/bin/sh", "-c", "chmod 666 /var/run/docker.sock 2>/dev/null || true; exec ./scripts/docker-entrypoint.sh ./WeKnora" ]
     ports:
       - "${APP_PORT:-8080}:8080"
     volumes:
       # 数据文件挂到项目目录下，便于直接查看与备份（见 .gitignore data/docker/）
-      - ./data/docker/files:/data/files
-      - ./data/docker/docreader-tmp:/tmp/docreader:ro
+      - ${DATA_DIR:-./data/docker}/files:/data/files
+      - ${DATA_DIR:-./data/docker}/docreader-tmp:/tmp/docreader:ro
       - ./config/config.yaml:/app/config/config.yaml
       # Optional: mount custom skills directory (allows adding skills without rebuilding image)
       - ./skills/preloaded:/app/skills/preloaded
       # Docker 沙箱默认关闭（见 WEKNORA_SANDBOX_DOCKER_ENABLED）。需要本机 daemon 时
       # 同时设 true 并挂载实际 socket——这等同宿主机 root，仅私有化单机。
       # 入口脚本会按 socket GID 把 appuser 加入对应组（compose group_add 在 gosu 后无效）。
-      # - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+
       # Optional: declarative built-in models. Copy config/builtin_models.yaml.example
       # to config/builtin_models.yaml, edit it for your deployment, then
       # uncomment the line below. See docs/BUILTIN_MODELS.md.
@@ -408,7 +410,7 @@
     expose:
       - "50051"
     volumes:
-      - ./data/docker/docreader-tmp:/tmp/docreader
+      - ${DATA_DIR:-./data/docker}/docreader-tmp:/tmp/docreader
     environment:
       # ========== 基础 ==========
       - TZ=${TZ:-Asia/Shanghai}
@@ -523,7 +525,7 @@
       - POSTGRES_DB=${DB_NAME}
     volumes:
       # postgres 数据目录挂到项目目录下，便于直接查看与备份（见 .gitignore data/docker/）
-      - ./data/docker/postgres:/var/lib/postgresql/data
+      - ${DATA_DIR:-./data/docker}/postgres:/var/lib/postgresql/data
     networks:
       - WeKnora-network
     healthcheck:
@@ -541,7 +543,7 @@
     container_name: WeKnora-redis
     command: redis-server --appendonly yes --maxmemory-policy noeviction --requirepass ${REDIS_PASSWORD}
     volumes:
-      - ./data/docker/redis:/data
+      - ${DATA_DIR:-./data/docker}/redis:/data
     restart: always
     networks:
       - WeKnora-network
@@ -557,7 +559,7 @@
     command: ["sh", "-c", "cp /template/settings.yml /etc/searxng/settings.yml && chmod 0644 /etc/searxng/settings.yml"]
     volumes:
       - ./docker/searxng/settings.yml:/template/settings.yml:ro
-      - ./data/docker/searxng_config:/etc/searxng
+      - ${DATA_DIR:-./data/docker}/searxng_config:/etc/searxng
     restart: "no"
     networks:
       - WeKnora-network
@@ -573,7 +575,7 @@
     ports:
       - "${SEARXNG_BIND:-127.0.0.1}:${SEARXNG_PORT:-8888}:8080"
     volumes:
-      - ./data/docker/searxng_config:/etc/searxng
+      - ${DATA_DIR:-./data/docker}/searxng_config:/etc/searxng
     environment:
       - SEARXNG_BASE_URL=http://localhost:${SEARXNG_PORT:-8888}/
       - INSTANCE_NAME=weknora-searxng
@@ -609,7 +611,7 @@
       - MINIO_ROOT_PASSWORD=${MINIO_SECRET_ACCESS_KEY:-minioadmin}
     command: server --console-address ":9001" /data
     volumes:
-      - ./data/docker/minio_data:/data
+      - ${DATA_DIR:-./data/docker}/minio_data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -625,7 +627,7 @@
     image: neo4j:2025.10.1
     container_name: WeKnora-neo4j
     volumes:
-      - ./data/docker/neo4j-data:/data
+      - ${DATA_DIR:-./data/docker}/neo4j-data:/data
     environment:
       - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
       - NEO4J_apoc_export_file_enabled=true
@@ -649,7 +651,7 @@
       - "${QDRANT_REST_PORT:-6333}:6333"
       - "${QDRANT_PORT:-6334}:6334"
     volumes:
-      - ./data/docker/qdrant_data:/qdrant/storage
+      - ${DATA_DIR:-./data/docker}/qdrant_data:/qdrant/storage
     networks:
       - WeKnora-network
     restart: unless-stopped
@@ -678,7 +680,7 @@
       - "19530:19530"
       - "9091:9091"
     volumes:
-      - ./data/docker/milvus_data:/var/lib/milvus
+      - ${DATA_DIR:-./data/docker}/milvus_data:/var/lib/milvus
     networks:
       - WeKnora-network
     restart: unless-stopped
@@ -701,7 +703,7 @@
       - "9035:8080"
       - "50052:50051"
     volumes:
-      - ./data/docker/weaviate_data:/var/lib/weaviate
+      - ${DATA_DIR:-./data/docker}/weaviate_data:/var/lib/weaviate
     networks:
       - WeKnora-network
     restart: unless-stopped
@@ -735,8 +737,8 @@
       - "${DORIS_FE_HTTP_PORT:-8030}:8030"
       - "${DORIS_FE_MYSQL_PORT:-9030}:9030"
     volumes:
-      - ./data/docker/doris_fe_meta:/opt/apache-doris/fe/doris-meta
-      - ./data/docker/doris_fe_log:/opt/apache-doris/fe/log
+      - ${DATA_DIR:-./data/docker}/doris_fe_meta:/opt/apache-doris/fe/doris-meta
+      - ${DATA_DIR:-./data/docker}/doris_fe_log:/opt/apache-doris/fe/log
     networks:
       - WeKnora-network
     restart: unless-stopped
@@ -755,8 +757,8 @@
     ports:
       - "${DORIS_BE_HTTP_PORT:-8040}:8040"
     volumes:
-      - ./data/docker/doris_be_storage:/opt/apache-doris/be/storage
-      - ./data/docker/doris_be_log:/opt/apache-doris/be/log
+      - ${DATA_DIR:-./data/docker}/doris_be_storage:/opt/apache-doris/be/storage
+      - ${DATA_DIR:-./data/docker}/doris_be_log:/opt/apache-doris/be/log
     networks:
       - WeKnora-network
     restart: unless-stopped
@@ -841,7 +843,7 @@
       CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
     volumes:
       - langfuse_clickhouse_data:/var/lib/clickhouse
-      - ./data/docker/langfuse_clickhouse_logs:/var/log/clickhouse-server
+      - ${DATA_DIR:-./data/docker}/langfuse_clickhouse_logs:/var/log/clickhouse-server
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
       interval: 5s
@@ -870,7 +872,7 @@
       # 9101：MinIO 控制台（可选，方便排障）
       - "${LANGFUSE_MINIO_CONSOLE_PORT:-9101}:9001"
     volumes:
-      - ./data/docker/langfuse_minio_data:/data
+      - ${DATA_DIR:-./data/docker}/langfuse_minio_data:/data
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -1004,14 +1006,9 @@
       - "${MCP_PORT:-8082}:8000"
     environment:
       - WEKNORA_BASE_URL=http://app:8080/api/v1
-      # 进程级回落身份：仅当请求未携带个人 key 时使用（stdio/单用户部署）。
-      # 多用户共享部署建议留空，并在下方开启 MCP_REQUIRE_USER_KEY。
       - WEKNORA_API_KEY=${WEKNORA_API_KEY:-}
-      # 设为 1 时强制所有网络请求携带个人 API Key（Authorization: Bearer 或 X-WeKnora-Key），
-      # 未携带者 401。共享部署推荐开启。
-      - MCP_REQUIRE_USER_KEY=${MCP_REQUIRE_USER_KEY:-}
-      # 个人 key 的自定义入站头名（默认 X-WeKnora-Key）
-      - MCP_USER_API_KEY_HEADER=${MCP_USER_API_KEY_HEADER:-}
+      # HTTP/SSE 传输必填：mcp-server 启动时若缺少此项会拒绝启动（客户端以 Authorization: Bearer 携带）
+      - MCP_SERVER_AUTH_TOKEN=${MCP_SERVER_AUTH_TOKEN:-}
       # 调用 WeKnora REST 的读超时（秒，默认 300）
       - WEKNORA_CHAT_TIMEOUT=${WEKNORA_CHAT_TIMEOUT:-300}
       # 是否校验 WeKnora 后端 TLS 证书（默认 true；自签证书可设 false）
@@ -1020,7 +1017,7 @@
       - MCP_ALLOWED_UPLOAD_DIRS=${MCP_ALLOWED_UPLOAD_DIRS:-/mcp-uploads}
     volumes:
       # 宿主机共享目录：文件放这里即可被 create_knowledge_from_file 直接读取
-      - ./data/docker/mcp-uploads:/mcp-uploads
+      - ${DATA_DIR:-./data/docker}/mcp-uploads:/mcp-uploads
     depends_on:
       app:
         condition: service_healthy
