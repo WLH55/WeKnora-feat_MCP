@@ -366,6 +366,10 @@ promoted, err := s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expecte
 
 解析后的后处理会按知识库 auto_tag_config 决定是否入队 knowledge:auto_tag（summary 队列）。处理器从当前 KB 已有标签中选择，模型回退 summary_model_id；max_tags 默认 3、上限 10，默认跳过已有标签文档。它只增量关联标签，不创建新分类，也不删除人工标签；失败不阻断文档入库。配置与新解析/重解析的生效范围见[知识库管理](../03-features/02-knowledge-base.md)。
 
+#### 知识库描述刷新（knowledgebase_profile.go）
+
+摘要任务的每次终态退出、后处理调度完成、文档删除、跨库移动完成，都会调用 `requestKnowledgeBaseProfileRefresh` 入队一次 `kb:profile`（summary 队列）。任务 ID 按知识库和 30 秒窗口分桶，一批上传或删除只触发一次聚合；处理器重算文档画像聚合，哈希未变则不调用模型。只有 `profile_config.enabled` 的文档知识库会入队，手动触发（`POST /knowledge-bases/:id/profile/generate`）不受此限制。
+
 #### 摘要刷新（knowledge_summary_refresh.go）
 
 首次入库之外，分块内容编辑、分块启停、自定义元数据变更都会让已有摘要过期，此时入队一次**摘要刷新**（也可由 `POST /knowledge/:id/regenerate-summary` 手动触发）：
@@ -443,14 +447,15 @@ stateDiagram-v2
 2. `filterByLastSpanActivity`：查 `knowledge_processing_spans` 的 `MAX(updated_at)` 心跳，心跳仍在阈值内的保留（仍在处理），无任何 span 的也判为卡死；
 3. `filterOutQueued`：通过 asynq TaskInspector 检查是否仍有排队任务，有则保留（只是在排队）。
 
-判定卡死的知识被更新为：
+判定卡死的知识逐行更新为 `parse_status = 'failed'`、`pending_subtasks_count = 0`，`error_message` 写明停在哪个阶段、最后一次进展时间，例如：
 
-```sql
-UPDATE knowledge SET parse_status = 'failed',
-    error_message = 'task stuck in processing > [threshold], recovered by housekeeping',
-    pending_subtasks_count = 0
-WHERE id IN (stuck_ids)
+```text
+task stuck in processing at docreader stage: no progress since 2026-09-22T09:37:54Z (> 2h10m0s), recovered by housekeeping
 ```
+
+同时关闭该知识最新一次 attempt 中仍处于 `pending`/`running` 的 span，错误码均为 `TASK_STALLED`，并补写 `duration_ms`：卡住的位置标为 `failed`，其余标为 `cancelled`。卡住的位置是正在运行的阶段 span；没有运行中的阶段时（`finalizing` 下后处理阶段已关闭），是最内层仍在运行的子 span，文案会带上它们的名字，如 `at postprocess stage (postprocess.summary)`。span 心跳查询失败时文案不写时间点。这样时间线上会显示卡在哪里，而不是一直转圈。
+
+前端在服务端判死之前会先给出提示：批量查询与 spans 接口为进行中的知识返回 `last_activity_at`；超过 20 分钟无进展时再返回服务端的判定 `stall_state`（与 Sweep A 的积压判定相同）。`stalled` 在列表、卡片和时间线上显示“疑似卡住”，时间线提供“停止解析”入口；`queued` 显示“排队中”，不提供停止入口；探测失败时没有判定，按普通解析中显示。安静期间轮询间隔放宽到 15 秒。
 
 阈值 `staleThreshold() = max(1h, DocumentProcessTimeout) + 10min`。
 

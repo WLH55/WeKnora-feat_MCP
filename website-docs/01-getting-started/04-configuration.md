@@ -66,7 +66,8 @@ flowchart LR
 | `enable_rerank` | bool | true | 启用 Rerank |
 | `fallback_prompt_id` | string | "default_fallback_prompt" | 兜底 prompt 模板 ID（`prompt_templates/fallback.yaml`，mode:"model"） |
 | `rewrite_prompt_id` | string | "default_rewrite" | 改写模板 ID（含 content 系统侧 + user 用户侧） |
-| `generate_summary_prompt_id` | string | "default_summary" | 文档摘要模板 ID |
+| `generate_summary_prompt_id` | string | "default_summary" | 文档画像模板 ID（短摘要 + gist/主题/类型/典型问题，JSON 输出） |
+| `generate_kb_description_prompt_id` | string | "default_kb_description" | 知识库描述模板 ID（输入为文档画像聚合，不是文档正文） |
 | `generate_session_title_prompt_id` | string | "default_session_title" | 会话标题生成模板 ID |
 | `extract_entities_prompt_id` / `extract_relationships_prompt_id` | string | "default_extract_entities" / "default_extract_relationships" | 图谱抽取模板 ID（`graph_extraction.yaml`） |
 | `generate_questions_prompt_id` | string | "default_generate_questions" | 预生成问题模板 ID |
@@ -75,10 +76,10 @@ flowchart LR
 
 | 名称 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `max_input_chars` | int | 16384 | 送入 LLM 的最大字符数 |
+| `max_input_chars` | int | 8192 | 送入 LLM 的最大字符数。文档画像只需要文档开头即可判断主题，8k 足够；旧值 16384/24576 会成倍增加每篇文档的摘要成本 |
 | `temperature` | float | 0.3 | 生成温度 |
 | `repeat_penalty` | float | 1.0 | 重复惩罚 |
-| `max_completion_tokens` | int | 2048 | 最大生成 token |
+| `max_completion_tokens` | int | 1024 | 最大生成 token（画像 JSON 各字段都很短） |
 | `no_match_prefix` | string | `<think>\n</think>\nNO_MATCH` | 模型输出以此为前缀时判定「未命中」触发 fallback |
 | `prompt_id` | string | "default_kb" | 系统 Prompt 模板 ID（`system_prompt.yaml`） |
 | `context_template_id` | string | "default_context" | 上下文拼装模板 ID（`context_template.yaml`） |
@@ -107,7 +108,7 @@ flowchart LR
 | 名称 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `enable_cross_tenant_access` | bool | false | 允许具备 `CanAccessAllTenants` 的用户跨空间访问（内网可开） |
-| `enable_rbac` | *bool | true | 空间角色强制鉴权；显式 `false` 进入仅记录不拦截的灰度模式（env `WEKNORA_TENANT_ENABLE_RBAC`） |
+| `enable_rbac` | *bool | true | 空间角色强制鉴权；显式 `false` 进入灰度模式，空间内的角色检查仅记录不拦截，跨空间访问仍然拦截（env `WEKNORA_TENANT_ENABLE_RBAC`） |
 | `max_owned_per_user` | int | 0（走 handler 默认） | 单个非超管可自建空间数上限；<0 关闭限制（env `WEKNORA_TENANT_MAX_OWNED_PER_USER`） |
 | `self_service_creation_enabled` | *bool | true | 普通用户能否自建空间（env `WEKNORA_TENANT_SELF_SERVICE_CREATION_ENABLED`） |
 | `default_session_name` / `default_session_title` / `default_session_description` | string | 空 | 新会话默认文案 |
@@ -206,12 +207,14 @@ AWS S3 的 `S3_ACCESS_KEY` / `S3_SECRET_KEY` 可以**同时留空**，此时走 
 
 | 名称 | 默认值 | 说明 |
 | --- | --- | --- |
-| `OLLAMA_BASE_URL` | http://host.docker.internal:11434 | Ollama 地址 |
+| `OLLAMA_BASE_URL` | http://host.docker.internal:11434 | 唯一的本地 Ollama 地址。`source=local` 的向量与对话模型共用它；未设置时进程用 `http://localhost:11434` |
 | `OLLAMA_OPTIONAL` | true | Ollama 不可用时仅告警不阻断启动 |
 | `BATCH_EMBED_SIZE` | 空 | 批量 embedding 大小 |
 | `VLM_HTTP_TIMEOUT_SECONDS` | 180 | VLM 单次请求超时 |
 | `BUILTIN_MODELS_CONFIG` | config/builtin_models.yaml | 内置模型声明文件路径（见下文） |
 | `WEKNORA_LLM_STREAM_RAW_DUMP` / `_DIR` | 空 | LLM 流原始转储（排障用） |
+
+向量模型名不由环境变量决定。在模型记录里把 `type=Embedding`、`source=local` 的 `name` 设为 Ollama 模型名（CLI 示例 `nomic-embed-text`，维度 768；快速开始用 `bge-m3`，维度 1024）。名为空时本地 embedder 回退到 `nomic-embed-text`。`EMBEDDING_MODEL_NAME` 只在 `builtin_models.yaml` 引用 `${EMBEDDING_MODEL_NAME}` 时生效（见下文「config/builtin_models.yaml.example：声明式内置模型」与仓库 `config/builtin_models.yaml.example`）。安装文档的 8GB 起点不含 Ollama 权重；Neo4j 默认关闭（`neo4j` profile）。
 
 ### 认证、租户与安全
 
@@ -234,8 +237,24 @@ AWS S3 的 `S3_ACCESS_KEY` / `S3_SECRET_KEY` 可以**同时留空**，此时走 
 | `WEKNORA_AUDIT_RETENTION_DAYS` | 90 | 审计日志保留天数 |
 | `WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL` | 空 | 引导第一个系统管理员。**不会创建用户**：该邮箱需先自行注册，下次启动时若部署内还没有任何系统管理员，才把它提升；已有管理员后本变量不再生效。详见[租户、用户与认证授权](../03-features/01-tenant-auth.md) |
 | `OIDC_AUTH_ENABLE` 及 `OIDC_AUTH_*` / `OIDC_USER_INFO_MAPPING_*` | false / 空 | OIDC 单点登录全套配置 |
-| `SSRF_WHITELIST` / `SSRF_WHITELIST_EXTRA` | 空 / `searxng,qdrant,milvus,weaviate,doris-fe,doris-be` | 出站请求 SSRF 白名单（app 与 docreader 共用） |
+| `SSRF_WHITELIST` / `SSRF_WHITELIST_EXTRA` | 空 / `searxng,qdrant,milvus,weaviate,doris-fe,doris-be,minio`（仅 app） | 出站请求 SSRF 白名单。`SSRF_WHITELIST` 为 app 与 docreader 共用；compose 只给 app 的 `SSRF_WHITELIST_EXTRA` 设了默认值，docreader 的同名变量默认为空 |
+| `SSRF_DNS_WHITELIST_ONLY` | false | 仅允许白名单出站。开启后，不在白名单的主机在 **DNS 查询前**即被拒绝，URL 校验处连 IP 直连也一并拒绝；域名只按名字匹配，写在白名单里的 CIDR 不再对域名生效。取值按布尔解析（`1/t/true` 开、`0/f/false` 关），**非空且无法解析的取值按「开」处理**。开启前的准备见下文 |
 | `IMAGE_HOST_KEEP_URL` | 空 | 保留原始 URL 的图片域名白名单 |
+
+#### 开启 `SSRF_DNS_WHITELIST_ONLY` 之前
+
+开启后白名单就是全部出站策略，需要先把所有出站地址写进 `SSRF_WHITELIST` 或 `SSRF_WHITELIST_EXTRA`。docreader 也要访问 compose 内的主机时，请写进两个服务共用的 `SSRF_WHITELIST`（它的 `SSRF_WHITELIST_EXTRA` 默认为空）。通常还要补上：
+
+- 模型服务地址（chat / embedding / rerank / VLM / ASR，含本机 Ollama 的 `localhost`）
+- OIDC 登录的 `dex`（或你的 IdP 域名）、MCP 服务地址、`docreader`
+- 对象存储（外部 S3/COS/OSS 等）、外部向量库、Langfuse 地址
+- 沙箱控制面地址：开启后「允许私网端点」不再能绕过白名单
+
+仍未覆盖的出站路径，按影响排序：
+
+1. **gRPC 向量库的运行时解析**：qdrant / milvus 客户端由 gRPC 自己的 resolver 解析 target，拨号器拿到的已是地址，因此这类主机是在**建客户端之前按名字**判断的（环境变量配置在启动时判断，控制台保存的配置走 URL 校验），而不是每次连接前。
+2. **Langfuse 的 OTLP 导出器**自带 HTTP 客户端，完全不走本机制。`LANGFUSE_HOST` 默认是 SaaS 地址，离线部署请关闭追踪或改成内网地址。
+3. **`HTTP(S)_PROXY`**：拨号器对代理主机的放行条件是「拨号地址与代理 URL 的 host 完全相等」。相等时代理主机即使不在白名单也会被解析和连接；不相等时（例如代理 URL 没写端口）会被当成非白名单直接拒绝。离线部署请 unset 代理，或把代理主机一并写进白名单。
 
 ### Docreader 解析（docreader 容器）
 
@@ -261,6 +280,7 @@ AWS S3 的 `S3_ACCESS_KEY` / `S3_SECRET_KEY` 可以**同时留空**，此时走 
 | `WEKNORA_CHAT_ATTACHMENT_TTL_HOURS` / `_WAIT_TIMEOUT_SEC` / `_OCR_CONCURRENCY` / `_OCR_MAX_PAGES` | 24 / 60 / 8 / 8 | 聊天附件解析保留时长、等待超时与 OCR 并发/页数上限 |
 | `WEKNORA_HOUSEKEEPING_ENABLED` | 启用 | 回收卡在 processing 的脏数据 |
 | `WEKNORA_DOCUMENT_PROCESS_TIMEOUT` / `WEKNORA_DOCREADER_CALL_TIMEOUT` | 2h / 30m | 文档处理任务与单次 RPC 超时 |
+| `WEKNORA_PADDLEOCR_VL_TIMEOUT` | 1000s | 自建 PaddleOCR-VL HTTP 请求超时，支持正数 Go duration（如 `5400s`、`90m`）；空值、无效值或非正数使用默认值。外层超时需留余量，例如本项 `90m`、DocReader `100m`、文档任务 `2h` |
 
 沙箱后端、网络策略、脚本开关与个人环境变量使用空间配置/API 管理，见[技能与沙箱](../03-features/22-skills-sandbox.md)。长期记忆与自动标签均默认关闭，分别使用租户 memory_config 和知识库 auto_tag_config，不用全局环境变量替代各空间配置。
 
@@ -335,11 +355,13 @@ AWS S3 的 `S3_ACCESS_KEY` / `S3_SECRET_KEY` 可以**同时留空**，此时走 
 
 | id | 系统 Prompt | 工具白名单 | 备注 |
 | --- | --- | --- | --- |
-| `rag-qa` | `progressive_rag_agent` | knowledge_search、grep_chunks、list_knowledge_chunks、get_document_info | temperature 0.7、max_iterations 30、FAQ 优先 |
-| `wiki-qa` | `wiki_researcher` | wiki_search、wiki_read_page、wiki_read_source_doc、wiki_flag_issue | 需 Wiki 已启用的知识库 |
+| `rag-qa` | `progressive_rag_agent` | search_knowledge、read_document、list_documents | temperature 0.7、max_iterations 30、FAQ 优先 |
+| `wiki-qa` | `wiki_researcher` | wiki_search、wiki_read_page、read_document、wiki_flag_issue | 需 Wiki 已启用的知识库 |
 | `hybrid-rag-wiki` | `hybrid_rag_wiki_agent` | Wiki + RAG 工具全集 | max_iterations 40，最灵活的预设 |
 | `data-analysis` | `data_analyst` | data_schema、data_analysis | temperature 0.3；`kb_filter: none_of: [faq]`；支持 csv/xlsx |
 | `custom` | 无 | 无预填 | 完全手动配置 |
+
+已保存配置里出现的旧工具名（`knowledge_search`、`grep_chunks` → `search_knowledge`；`list_knowledge_chunks`、`get_document_info`、`wiki_read_source_doc` → `read_document`）会在运行时自动映射为新工具，无需手动改写。
 
 ## config/builtin_agents.yaml：内置 Agent
 
@@ -372,6 +394,8 @@ builtin_models:
 ```
 
 注意：未设置的 `${ENV}` 会保留字面量以便暴露配置错误；非字符串字段（`type`、`source`、`is_default`、`dimension` 等）必须写字面值；从文件删除条目**不会**自动删库，需手动清理。
+
+本地 Ollama：把 `source` 写成 `local`，`name` 用 Ollama 模型名（向量侧可用 `${EMBEDDING_MODEL_NAME}`）。完整注释示例见 `config/builtin_models.yaml.example` 的 “one local Ollama” 段；`dimension` 须为字面量（CLI 示例 `nomic-embed-text` 为 768）。
 
 ## 配置优先级速记
 
