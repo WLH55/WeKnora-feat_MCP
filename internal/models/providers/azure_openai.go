@@ -164,6 +164,7 @@ func newAzureOpenaiProvider() *Definition {
 				SupportsReasoningEffort: api.Ptr(true),
 				SupportsDeveloperRole:   api.Ptr(true),
 				SupportsStore:           api.Ptr(true),
+				SupportsImageDetail:     api.Ptr(true),
 				PromptCacheKey:          api.Ptr(true),
 				PromptCacheAccounting:   api.Ptr(true),
 			},

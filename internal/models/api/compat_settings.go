@@ -47,6 +47,7 @@ type OpenAICompletionsCompat struct {
 	SupportsParallelToolCalls    *bool           `json:"supports_parallel_tool_calls,omitempty"`
 	SupportsResponseFormat       *bool           `json:"supports_response_format,omitempty"`
 	SupportsMultiContent         *bool           `json:"supports_multi_content,omitempty"`
+	SupportsImageDetail          *bool           `json:"supports_image_detail,omitempty"`
 	ReplayReasoningContent       *bool           `json:"replay_reasoning_content,omitempty"`
 	PromptCacheKey               *bool           `json:"prompt_cache_key,omitempty"`
 	CacheControlFormat           *string         `json:"cache_control_format,omitempty"`
@@ -98,6 +99,15 @@ type OpenAICompletionsSettings struct {
 	SupportsResponseFormat    bool
 	// SupportsMultiContent false flattens image/text parts to plain text.
 	SupportsMultiContent bool
+	// SupportsImageDetail gates the image_url detail field. detail is an
+	// OpenAI-specific parameter that defaults to "auto" server-side, so
+	// omitting it is semantically identical for compliant APIs — while strict
+	// OpenAI-compatible gateways reject the field outright (MiniMax answers
+	// HTTP 400 "invalid image detail: auto", error 2013, also reachable
+	// through third-party proxies). Only vendors verified to accept it
+	// declare it; an omitted field never reaches the wire
+	// (json:"detail,omitempty").
+	SupportsImageDetail bool
 	// ReplayReasoningContent sends reasoning_content on prior assistant turns.
 	ReplayReasoningContent bool
 	// PromptCacheKey sends prompt_cache_key / prompt_cache_retention and the
