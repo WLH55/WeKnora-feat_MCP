@@ -51,11 +51,20 @@ ENV GO_VERSION=${GO_VERSION_ARG}
 # engine; pass WITH_ANYDOC=0 to skip the Rust toolchain (~few minutes and
 # ~1 GB of build-stage layers).
 ARG WITH_ANYDOC=1
+# Optional rustup/crates mirror (e.g. https://rsproxy.cn) for networks where
+# static.rust-lang.org / crates.io transfers die mid-stream. Empty = official.
+ARG RUSTUP_MIRROR=""
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     if [ "$WITH_ANYDOC" = "1" ]; then \
+        if [ -n "$RUSTUP_MIRROR" ]; then \
+            export RUSTUP_DIST_SERVER="$RUSTUP_MIRROR" RUSTUP_UPDATE_ROOT="$RUSTUP_MIRROR/rustup" && \
+            mkdir -p "$CARGO_HOME" && \
+            printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
+                "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
+        fi && \
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable && \
         ./scripts/build-anydoc-lib.sh; \
@@ -89,7 +98,14 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
     rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ARG RUSTUP_MIRROR=""
+RUN if [ -n "$RUSTUP_MIRROR" ]; then \
+        export RUSTUP_DIST_SERVER="$RUSTUP_MIRROR" RUSTUP_UPDATE_ROOT="$RUSTUP_MIRROR/rustup" && \
+        mkdir -p "$CARGO_HOME" && \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
+            "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
+    fi && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
 ARG TARGETOS
 ARG TARGETARCH

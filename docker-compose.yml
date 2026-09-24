@@ -34,6 +34,7 @@
         - APK_MIRROR_ARG=${APK_MIRROR_ARG:-}
         - GOPROXY_ARG=${GOPROXY:-https://goproxy.cn,direct}
         - WITH_ANYDOC=${WITH_ANYDOC:-1}
+        - RUSTUP_MIRROR=${RUSTUP_MIRROR:-}
     container_name: WeKnora-app
     ports:
       - "${APP_PORT:-8080}:8080"
@@ -407,6 +408,7 @@
       dockerfile: docker/Dockerfile.docreader
       args:
         - APT_MIRROR=${APT_MIRROR:-}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-}
     container_name: WeKnora-docreader
     # docreader gRPC ships without auth/TLS and is only consumed by the app
     # container over the WeKnora-network (DOCREADER_ADDR defaults to
