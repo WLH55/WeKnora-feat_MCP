@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd/download cmd/download
 RUN go run cmd/download/duckdb/duckdb.go
 COPY . .
-RUN bash ./scripts/check-license-bundle.sh
+RUN --mount=type=cache,target=/go/pkg/mod bash ./scripts/copy-licenses.sh /license-bundle
 
 # Get version and commit info for build injection
 ARG VERSION_ARG
@@ -70,13 +70,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     fi
 RUN --mount=type=cache,target=/go/pkg/mod cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
 
-# Build the paired extension and fetch the checksum-pinned native daemon.
-# Node runs on the builder architecture; only bsk targets the runtime image.
-# Placed after the builder stage: the node slim base ships without
-# ca-certificates, and the apt mirror + git clone + release download below
+# Build the extension and compile the native daemon from the pinned source.
+# Node runs on the runtime architecture: the upstream script refuses to run
+# when host platform differs from target, so the Rust/cmake toolchain must
+# match the final image. Placed after the builder stage: the node slim base
+# ships without ca-certificates, and the apt mirror + rustup + git clone below
 # are all HTTPS, so the CA bundle is copied over from the builder first
 # (same chicken-and-egg as the final stage).
-FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
+FROM --platform=$TARGETPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
 WORKDIR /build
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG APK_MIRROR_ARG
@@ -84,10 +85,12 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
         sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get -o Acquire::Retries=5 update && \
-    apt-get -o Acquire::Retries=5 install -y --no-install-recommends git python3 ca-certificates && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends git python3 ca-certificates curl build-essential cmake pkg-config && \
     rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
-COPY patches/browserskill ./patches/browserskill
 ARG TARGETOS
 ARG TARGETARCH
 RUN bash scripts/build_browserskill.sh /opt/weknora/browserskill "${TARGETOS}/${TARGETARCH}"
@@ -101,7 +104,7 @@ ARG APK_MIRROR_ARG
 
 # Pairing derives the gateway URL from the user's page origin by default.
 ENV BROWSERSKILL_BINARY=/opt/weknora/browserskill/bsk \
-    BROWSERSKILL_EXTENSION_PATH=/opt/weknora/browserskill/browser-skill-weknora-0.2.1.zip
+    BROWSERSKILL_EXTENSION_PATH=/opt/weknora/browserskill/browser-skill-weknora-0.3.1.zip
 COPY --from=browserskill /opt/weknora/browserskill /opt/weknora/browserskill
 
 # Create a non-root user first
@@ -151,8 +154,7 @@ COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/dataset/samples ./dataset/samples
 COPY --from=builder /root/.duckdb /home/appuser/.duckdb
 COPY --from=builder /app/WeKnora .
-COPY LICENSE THIRD_PARTY_NOTICES.md ./
-COPY licenses ./licenses
+COPY --from=builder /license-bundle/ ./
 
 # Copy and make entrypoint script executable
 COPY --from=builder /app/scripts/docker-entrypoint.sh ./scripts/docker-entrypoint.sh
