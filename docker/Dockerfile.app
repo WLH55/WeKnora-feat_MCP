@@ -70,13 +70,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     fi
 RUN --mount=type=cache,target=/go/pkg/mod cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
 
-# Build the paired extension and fetch the checksum-pinned native daemon.
-# Node runs on the builder architecture; only bsk targets the runtime image.
+# Build the extension and compile the daemon from the same pinned source.
+# Runs on the runtime architecture: the daemon is a native binary that ships in
+# the final image, while the extension is architecture-independent.
 # Placed after the builder stage: the node slim base ships without
-# ca-certificates, and the apt mirror + git clone + release download below
+# ca-certificates, and the apt mirror + git clone + toolchain download below
 # are all HTTPS, so the CA bundle is copied over from the builder first
 # (same chicken-and-egg as the final stage).
-FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
+FROM --platform=$TARGETPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
 WORKDIR /build
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG APK_MIRROR_ARG
@@ -84,8 +85,13 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
         sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get -o Acquire::Retries=5 update && \
-    apt-get -o Acquire::Retries=5 install -y --no-install-recommends git python3 ca-certificates && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        git python3 ca-certificates curl build-essential cmake pkg-config && \
     rm -rf /var/lib/apt/lists/*
+# The daemon is compiled from source; the slim base ships no Rust toolchain.
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
 ARG TARGETOS
 ARG TARGETARCH

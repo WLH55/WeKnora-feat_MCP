@@ -33,3 +33,8 @@ go.sum text eol=lf
 # git apply inside the browserskill image build needs byte-exact context;
 # CRLF checkouts make every hunk "patch does not apply".
 patches/browserskill/*.patch text eol=lf
+
+# scripts/check-license-bundle.sh reads the source manifest field-by-field and
+# requires the checksum column to be 64 hex digits; a CRLF checkout leaves a
+# trailing carriage return on that field and fails the validation.
+licenses/sources/modules.tsv text eol=lf
