@@ -80,8 +80,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     else \
         uv_sync_flags="--locked"; \
     fi && \
+    export UV_HTTP_TIMEOUT=120 UV_CONCURRENT_DOWNLOADS=4 UV_CACHE_DIR=/root/.cache/uv && \
     pip install uv --break-system-packages && \
-    python -m uv sync $uv_sync_flags --no-dev
+    sync_ok=0; \
+    for attempt in 1 2 3; do \
+        if python -m uv sync $uv_sync_flags --no-dev; then sync_ok=1; break; \
+        else echo "uv sync attempt ${attempt}/3 failed on a flaky link; cached wheels survive, retrying"; \
+             [ "$attempt" -lt 3 ] && sleep 5; fi; \
+    done; \
+    [ "$sync_ok" = "1" ]
 
 # 复制源代码和生成脚本
 COPY docreader docreader
