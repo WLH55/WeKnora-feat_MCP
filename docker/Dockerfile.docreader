@@ -71,7 +71,8 @@ COPY docreader/pyproject.toml docreader/uv.lock ./
 # 走镜像时把锁文件里的源与文件直链原地改写为镜像路径（常见约定：
 # …/pypi/simple ↔ …/pypi/packages），版本与哈希校验仍由锁文件锁定。
 ARG PIP_INDEX_URL=""
-RUN if [ -n "$PIP_INDEX_URL" ]; then \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "$PIP_INDEX_URL" ]; then \
         export UV_DEFAULT_INDEX="$PIP_INDEX_URL"; \
         pkg_base="${PIP_INDEX_URL%/simple}"; \
         sed -i "s|https://files.pythonhosted.org/packages/|${pkg_base}/packages/|g; s|https://pypi.org/simple|${PIP_INDEX_URL}|g" uv.lock; \
