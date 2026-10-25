@@ -32,14 +32,14 @@ RUN if [ -n "$RUSTUP_MIRROR" ]; then \
         printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
             "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
     fi && \
-    curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
-        -o /tmp/rustup-init.sh https://sh.rustup.rs && \
     rustup_ok=0; \
     for attempt in 1 2 3; do \
-        if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
+        if curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
+                -o /tmp/rustup-init.sh https://sh.rustup.rs \
+           && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
             rustup_ok=1; break; \
         fi; \
-        echo "rustup install attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
+        echo "rustup bootstrap attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
         sleep 5; \
     done; rm -f /tmp/rustup-init.sh; [ "$rustup_ok" = "1" ]
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
@@ -113,14 +113,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
             printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
                 "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
         fi && \
-        curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
-            -o /tmp/rustup-init.sh https://sh.rustup.rs && \
         rustup_ok=0; \
         for attempt in 1 2 3; do \
-            if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
+            if curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
+                    -o /tmp/rustup-init.sh https://sh.rustup.rs \
+               && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
                 rustup_ok=1; break; \
             fi; \
-            echo "rustup install attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
+            echo "rustup bootstrap attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
             sleep 5; \
         done; rm -f /tmp/rustup-init.sh; [ "$rustup_ok" = "1" ] && \
         ./scripts/build-anydoc-lib.sh; \
