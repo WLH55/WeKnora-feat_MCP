@@ -3,14 +3,20 @@ FROM --platform=$TARGETPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b
 WORKDIR /build
 # Use the same optional Debian mirror as the Go builder and runtime stages.
 ARG APK_MIRROR_ARG
-# This base image has no CA certificates. Install them from the original HTTP
-# Debian source before swapping in a mirror: mirrors.tencent.com redirects
-# apt to HTTPS, and that handshake fails without a trust store.
+# This base image has no CA certificates, and two networks bite here: the
+# mirror redirects apt to HTTPS (unverifiable without a trust store), while
+# the original deb.debian.org may itself be unreachable (Fastly 502s). When
+# a mirror is set: swap first, then bootstrap ca-certificates over that
+# redirect with peer verification disabled for this step only; every later
+# apt call runs with normal verification. Without a mirror, plain HTTP
+# debian.org works as upstream intends.
 RUN if [ -n "$APK_MIRROR_ARG" ]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends ca-certificates && \
-        rm -rf /var/lib/apt/lists/* && \
         sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    if [ -n "$APK_MIRROR_ARG" ]; then \
+        apt-get -o Acquire::Retries=5 -o Acquire::https::Verify-Peer=false update && \
+        apt-get -o Acquire::Retries=5 -o Acquire::https::Verify-Peer=false install -y --no-install-recommends ca-certificates && \
+        rm -rf /var/lib/apt/lists/*; \
     fi && \
     apt-get -o Acquire::Retries=5 update && \
     apt-get -o Acquire::Retries=5 install -y --no-install-recommends git python3 ca-certificates curl build-essential cmake pkg-config && \
