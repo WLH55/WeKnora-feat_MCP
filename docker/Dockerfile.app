@@ -34,8 +34,14 @@ RUN if [ -n "$RUSTUP_MIRROR" ]; then \
     fi && \
     curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
         -o /tmp/rustup-init.sh https://sh.rustup.rs && \
-    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable && \
-    rm -f /tmp/rustup-init.sh
+    rustup_ok=0; \
+    for attempt in 1 2 3; do \
+        if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
+            rustup_ok=1; break; \
+        fi; \
+        echo "rustup install attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
+        sleep 5; \
+    done; rm -f /tmp/rustup-init.sh; [ "$rustup_ok" = "1" ]
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
 ARG TARGETOS
 ARG TARGETARCH
@@ -109,8 +115,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         fi && \
         curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
             -o /tmp/rustup-init.sh https://sh.rustup.rs && \
-        sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable && \
-        rm -f /tmp/rustup-init.sh && \
+        rustup_ok=0; \
+        for attempt in 1 2 3; do \
+            if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
+                rustup_ok=1; break; \
+            fi; \
+            echo "rustup install attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
+            sleep 5; \
+        done; rm -f /tmp/rustup-init.sh; [ "$rustup_ok" = "1" ] && \
         ./scripts/build-anydoc-lib.sh; \
     fi
 
