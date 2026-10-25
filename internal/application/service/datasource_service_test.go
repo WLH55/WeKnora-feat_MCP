@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	apprepo "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/datasource"
@@ -92,7 +94,7 @@ func (s *processSyncKBService) ListKnowledgeBasesByTenantID(context.Context, uin
 }
 
 func (s *processSyncKBService) UpdateKnowledgeBase(
-	context.Context, string, string, string, *types.KnowledgeBaseConfig,
+	context.Context, string, string, string, *types.KnowledgeBaseConfig, *types.VLMConfig,
 ) (*types.KnowledgeBase, error) {
 	return nil, nil
 }
@@ -110,6 +112,10 @@ func (s *processSyncKBService) HybridSearchWithRerank(
 ) (*types.RetrievalResult, error) {
 	results, err := s.HybridSearch(ctx, id, params)
 	return &types.RetrievalResult{Results: results}, err
+}
+
+func (s *processSyncKBService) ReadChunkImage(context.Context, *types.SearchResult) ([]byte, error) {
+	return nil, nil
 }
 
 func (s *processSyncKBService) GetQueryEmbedding(context.Context, string, string) ([]float32, error) {
@@ -216,6 +222,20 @@ func TestAllFetchedItemsFailedErrorTruncatesLongDetail(t *testing.T) {
 	assert.Contains(t, err.Error(), "...")
 }
 
+func TestAllFetchedItemsFailedErrorTruncatesChineseDetailAtRuneBoundary(t *testing.T) {
+	// 499 ASCII bytes put byte 500 inside the first three-byte rune.
+	message := strings.Repeat("x", 499) + strings.Repeat("导出失败", 50)
+	err := allFetchedItemsFailedError(&types.SyncResult{
+		Total:  1,
+		Failed: 1,
+		Errors: []types.SyncItemError{{Message: message}},
+	})
+	require.Error(t, err)
+	assert.True(t, utf8.ValidString(err.Error()), "error message must be valid UTF-8")
+	assert.LessOrEqual(t, len(err.Error()), 560)
+	assert.True(t, strings.HasSuffix(err.Error(), strings.Repeat("x", 499)+"..."))
+}
+
 const deletedItemConnectorType = "test-sync-deletion"
 
 type deletedItemConnector struct{}
@@ -277,7 +297,7 @@ type deletionLookupKnowledgeRepo struct {
 	interfaces.KnowledgeRepository
 	knowledge         *types.Knowledge
 	lookupErr         error
-	metadataUpdates   []map[string]string // metadata persisted via UpdateKnowledge
+	metadataUpdates   []map[string]string // metadata persisted via UpdateKnowledge / UpdateKnowledgeColumn
 	metadataUpdateErr error
 	hardDeleted       []string
 	hardDeleteErr     error
@@ -299,6 +319,19 @@ func (r *deletionLookupKnowledgeRepo) UpdateKnowledge(_ context.Context, knowled
 	}
 	r.metadataUpdates = append(r.metadataUpdates, metadata)
 	return nil
+}
+
+func (r *deletionLookupKnowledgeRepo) UpdateKnowledgeColumn(
+	ctx context.Context, id string, column string, value interface{},
+) error {
+	if column != "metadata" {
+		return fmt.Errorf("unexpected column update %q", column)
+	}
+	raw, ok := value.(types.JSON)
+	if !ok {
+		return fmt.Errorf("unexpected metadata value %T", value)
+	}
+	return r.UpdateKnowledge(ctx, &types.Knowledge{ID: id, Metadata: raw})
 }
 
 func (r *deletionLookupKnowledgeRepo) FindByDataSourceExternalID(

@@ -32,8 +32,6 @@ var (
 	reMarkdownLink = regexp.MustCompile(`\[([^\]]+)\]\([^()\s]*(?:\([^)]*\)[^()\s]*)*\)`)
 	// reRawURL matches standalone http(s) URLs.
 	reRawURL = regexp.MustCompile(`https?://[^\s)\]>]+`)
-	// reCodeBlock captures the semantic body of fenced code blocks.
-	reCodeBlock = regexp.MustCompile("(?s)```[^\\r\\n]*\\r?\\n(.*?)\\r?\\n?```")
 	// reLatexBlock captures the semantic body of block-level LaTeX ($$...$$).
 	reLatexBlock = regexp.MustCompile(`(?s)\$\$(.*?)\$\$`)
 	// reTableSep matches table separator rows like |---|---|.
@@ -65,8 +63,59 @@ var (
 // all meaningful semantic content while removing formatting that would
 // confuse text-similarity scoring.
 func CleanPassage(text string) string {
-	// 1. Unwrap code blocks so code-only candidates remain rerankable.
-	text = reCodeBlock.ReplaceAllString(text, "$1")
+	var out, prose strings.Builder
+	var fenceChar byte
+	fenceLength := 0
+	flushProse := func() {
+		if prose.Len() == 0 {
+			return
+		}
+		out.WriteString(cleanPassageProse(prose.String()))
+		prose.Reset()
+	}
+
+	// Keep fenced code separate from prose throughout cleaning. Unwrapping
+	// first would let later passes delete XML, URLs and operators in code.
+	for line := range strings.SplitAfterSeq(text, "\n") {
+		marker, length, tail := passageFence(line)
+		if fenceLength == 0 {
+			if length < 3 || (marker == '`' && strings.ContainsRune(tail, '`')) {
+				prose.WriteString(line)
+				continue
+			}
+			flushProse()
+			fenceChar, fenceLength = marker, length
+		} else if marker == fenceChar && length >= fenceLength && strings.Trim(tail, " \t\r\n") == "" {
+			fenceLength = 0
+		} else {
+			out.WriteString(line)
+		}
+	}
+	flushProse()
+	return strings.TrimSpace(out.String())
+}
+
+// passageFence recognizes a top-level fence with up to three leading spaces.
+// Matching type/length and a whitespace-only closing tail follow CommonMark
+// 4.5. This helper does not recognize container, indented or inline code.
+func passageFence(line string) (marker byte, length int, tail string) {
+	trimmed := strings.TrimLeft(line, " ")
+	if len(line)-len(trimmed) > 3 || len(trimmed) == 0 {
+		return 0, 0, ""
+	}
+	marker = trimmed[0]
+	if marker != '`' && marker != '~' {
+		return 0, 0, ""
+	}
+	for length < len(trimmed) && trimmed[length] == marker {
+		length++
+	}
+	return marker, length, trimmed[length:]
+}
+
+// cleanPassageProse leaves boundary whitespace intact so code and surrounding
+// text retain their line boundaries when the cleaned segments are assembled.
+func cleanPassageProse(text string) string {
 	// 2. Unwrap LaTeX blocks so formula-only candidates remain rerankable.
 	text = reLatexBlock.ReplaceAllString(text, "$1")
 	// 3. Remove HTML tags
@@ -111,7 +160,7 @@ func CleanPassage(text string) string {
 	// 12. Collapse excessive newlines
 	text = reExcessiveNewlines.ReplaceAllString(text, "\n\n")
 
-	return strings.TrimSpace(text)
+	return text
 }
 
 // EnrichedPassage is the cleaned chunk body plus the image captions, OCR text
@@ -120,6 +169,14 @@ func CleanPassage(text string) string {
 func EnrichedPassage(ctx context.Context, result *types.SearchResult) string {
 	combinedText := CleanPassage(result.Content)
 	var enrichments []string
+	// An image OCR or caption chunk's body is that same text, and its
+	// image_info repeats it; appending it again doubled the passage.
+	body := strings.TrimSpace(result.Content)
+	addImageText := func(text string) {
+		if text != "" && strings.TrimSpace(text) != body {
+			enrichments = append(enrichments, text)
+		}
+	}
 
 	if result.ImageInfo != "" {
 		var imageInfos []types.ImageInfo
@@ -127,12 +184,8 @@ func EnrichedPassage(ctx context.Context, result *types.SearchResult) string {
 			logger.Warnf(ctx, "[Rerank] Failed to parse image info of chunk %s: %v", result.ID, err)
 		} else {
 			for _, img := range imageInfos {
-				if img.Caption != "" {
-					enrichments = append(enrichments, img.Caption)
-				}
-				if img.OCRText != "" {
-					enrichments = append(enrichments, img.OCRText)
-				}
+				addImageText(img.Caption)
+				addImageText(img.OCRText)
 			}
 		}
 	}
@@ -163,11 +216,21 @@ func EnrichedPassage(ctx context.Context, result *types.SearchResult) string {
 //
 // An empty enriched body stays empty: a title alone is not evidence that
 // the chunk answers anything.
+//
+// The chunk's heading breadcrumb (ContextHeader) goes between the two for the
+// same reason: it was embedded with the chunk, so vector search can find
+// "7 天内可申请" under "## 退款政策" while a model scoring the bare body
+// rejects it.
 func ModelPassage(ctx context.Context, result *types.SearchResult) string {
 	passage := EnrichedPassage(ctx, result)
-	title := strings.TrimSpace(result.KnowledgeTitle)
-	if strings.TrimSpace(passage) == "" || title == "" || result.ChunkType == string(types.ChunkTypeFAQ) {
+	if strings.TrimSpace(passage) == "" || result.ChunkType == string(types.ChunkTypeFAQ) {
 		return passage
 	}
-	return title + "\n\n" + passage
+	if header := strings.TrimSpace(result.ContextHeader); header != "" {
+		passage = header + "\n\n" + passage
+	}
+	if title := strings.TrimSpace(result.KnowledgeTitle); title != "" {
+		passage = title + "\n\n" + passage
+	}
+	return passage
 }

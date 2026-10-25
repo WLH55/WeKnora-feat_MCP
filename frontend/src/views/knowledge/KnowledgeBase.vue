@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useAssistantDataChange } from '@/utils/assistantDataChange';
 import { ref, onMounted, onUnmounted, watch, reactive, computed, nextTick } from "vue";
 import { MessagePlugin } from "tdesign-vue-next";
 import DocContent from "@/components/doc-content.vue";
@@ -54,6 +55,7 @@ import type { KnowledgeProcessOverrides } from '@/types/knowledgeProcess';
 import { useUploadConfirmStore, type UploadConfirmResult } from '@/stores/uploadConfirm';
 import { useUploadTasksStore } from '@/stores/uploadTasks';
 import WikiBrowser from './wiki/WikiBrowser.vue';
+import ImageGallery from './gallery/ImageGallery.vue';
 import { getWikiStats } from '@/api/wiki';
 import {
   isKnowledgeParseInFlight,
@@ -66,7 +68,9 @@ import { resolveKnowledgeDownloadFileName } from './knowledgeDownloadFileName';
 import {
   buildUploadFileName,
   canMoveFolderTo,
+  childFolders,
   folderBreadcrumbs as buildFolderBreadcrumbs,
+  folderDocumentCounts,
   folderPathExists as folderExistsInTree,
   isFilteringDocuments,
   ROOT_FOLDER_PATH,
@@ -81,6 +85,7 @@ import {
 } from './documentSorting';
 import { useI18n } from 'vue-i18n';
 import { useMarqueeSelect } from '@/hooks/useMarqueeSelect';
+import { useAssistantPageContext } from '@/composables/useAssistantPageContext';
 import type { ParserEngineInfo } from '@/api/system';
 const route = useRoute();
 const { t } = useI18n();
@@ -91,7 +96,7 @@ const kbLoading = ref(false);
 const docListLoading = ref(true);
 const isFAQ = computed(() => (kbInfo.value?.type || '') === 'faq');
 const isWiki = computed(() => !!kbInfo.value?.indexing_strategy?.wiki_enabled);
-const validTabs = ['documents', 'wiki', 'graph'] as const
+const validTabs = ['documents', 'wiki', 'graph', 'gallery'] as const
 type KbTab = typeof validTabs[number]
 const initTab = validTabs.includes(route.query.tab as any) ? (route.query.tab as KbTab) : 'documents'
 const activeKbTab = ref<KbTab>(initTab);
@@ -108,6 +113,27 @@ const wikiIndexingTip = computed(() => {
   if (!wikiIsIndexing.value) return ''
   return t('knowledgeEditor.wikiBrowser.queueStatus', { count: wikiStatus.value.pendingTasks || 0 })
 })
+// The views of this knowledge base, in header order. Wiki and graph only
+// exist on wiki KBs; a stale wiki/graph tab on another KB renders documents,
+// so the header marks documents active then too.
+const kbViewTabs = computed(() => {
+  const w = 'knowledgeEditor.wikiBrowser'
+  const tabs: Array<{ key: KbTab; icon: string; label: string; tip: string; indexing?: boolean }> = [
+    { key: 'documents', icon: 'file', label: t(`${w}.tabDocuments`), tip: t(`${w}.tabDocumentsTip`) },
+  ]
+  if (isWiki.value) {
+    const indexing = wikiIsIndexing.value
+    tabs.push(
+      { key: 'wiki', icon: 'book-open', label: 'Wiki', tip: indexing ? wikiIndexingTip.value : t(`${w}.tabWikiTip`), indexing },
+      { key: 'graph', icon: 'relation', label: t(`${w}.tabGraph`), tip: indexing ? wikiIndexingTip.value : t(`${w}.tabGraphTip`), indexing },
+    )
+  }
+  tabs.push({ key: 'gallery', icon: 'image', label: t(`${w}.tabGallery`), tip: t(`${w}.tabGalleryTip`) })
+  return tabs
+})
+const shownKbTab = computed<KbTab>(() =>
+  kbViewTabs.value.some((tab) => tab.key === activeKbTab.value) ? activeKbTab.value : 'documents',
+)
 const onWikiStatusChange = (payload: { pendingTasks: number; isActive: boolean; pendingIssues: number }) => {
   wikiStatus.value = payload
 }
@@ -259,7 +285,8 @@ const isOwner = computed(() => {
   // those as tenant-owned so the role gate applies (Admin+ can manage,
   // Viewer cannot).
   if (!creatorId) return false;
-  return creatorId === userId;
+  // A creator demoted to Viewer no longer manages it (access.CreatorRoleFloor).
+  return creatorId === userId && authStore.hasRole('contributor');
 });
 
 // Current KB's shared record (when accessed via organization share)
@@ -290,7 +317,7 @@ const effectiveKBPermission = computed(() => orgStore.getKBPermission(kbId.value
 // the KB. The backend's RBAC middleware authorizes based on the active
 // tenant, not on creator_id, so a creator viewing their own KB from a
 // different tenant context will be 403'd on write. Otherwise: KB creator
-// (any role) or tenant Admin+ in the home tenant.
+// (Contributor+) or tenant Admin+ in the home tenant.
 //
 // A resolved cross-tenant permission (org share or shared-agent visibility,
 // already capped server-side by effective = min(share, org_role, tenant_role))
@@ -411,6 +438,18 @@ const onCardMoreVisibleChange = (visible: boolean, item: KnowledgeCard) => {
   }
 };
 let isCardDetails = ref(false);
+useAssistantPageContext(() => {
+  if (!kbId.value) return null;
+  const docOpen = isCardDetails.value && !!details.id;
+  return {
+    page: 'knowledge_base',
+    knowledgeBaseId: kbId.value,
+    knowledgeBaseName: kbInfo.value?.id === kbId.value ? kbInfo.value?.name : undefined,
+    chatModelId: kbInfo.value?.id === kbId.value ? kbInfo.value?.summary_model_id || undefined : undefined,
+    knowledgeId: docOpen ? details.id : undefined,
+    knowledgeTitle: docOpen ? details.title : undefined,
+  };
+});
 let timeout: ReturnType<typeof setTimeout> | null = null;
 let knowledgeScroll = ref()
 let page = 1;
@@ -543,26 +582,17 @@ const applyOptimisticBatchReparse = (ids: string[]) => {
   }
 };
 
-const syncReparseAckFromServer = (ids: string[]) => {
-  for (const id of ids) {
-    if (!pendingReparseAck.value.has(id)) continue;
-    const card = cardList.value.find((c) => c.id === id);
-    if (card && isParseInFlight(card.parse_status)) {
-      pendingReparseAck.value.delete(id);
-    }
-  }
-};
-
 const awaitBatchReparseReflection = async (ids: string[]) => {
+  // updateStatus already polls in-flight rows and acknowledges the worker.
+  // Only bound the optimistic window here: reloading page 1 discards loaded
+  // pages, flashes the list spinner and can refresh a different folder/KB.
   const maxPolls = 30;
   const delayMs = 400;
-  for (let i = 0; i < maxPolls && pendingReparseAck.value.size > 0; i++) {
-    await loadKnowledgeFiles(kbId.value);
-    syncReparseAckFromServer(ids);
-    applyOptimisticBatchReparse(Array.from(pendingReparseAck.value));
+  for (let i = 0; i < maxPolls && ids.some(id => pendingReparseAck.value.has(id)); i++) {
     await new Promise<void>((r) => setTimeout(r, delayMs));
   }
-  pendingReparseAck.value.clear();
+  // Another batch may have been submitted while this one was waiting.
+  ids.forEach(id => pendingReparseAck.value.delete(id));
 };
 
 const confirmBatchReparse = async () => {
@@ -667,6 +697,7 @@ const sourceOptions = computed(() => [
   { label: t('knowledgeBase.channelYuque'), value: 'yuque' },
   { label: t('knowledgeBase.channelConfluence'), value: 'confluence' },
   { label: t('knowledgeBase.channelGitLab'), value: 'gitlab' },
+  { label: t('knowledgeBase.channelSeafile'), value: 'seafile' },
   { label: t('knowledgeBase.channelIma'), value: 'ima' },
   { label: t('knowledgeBase.channelWechat'), value: 'wechat' },
   { label: t('knowledgeBase.channelWecom'), value: 'wecom' },
@@ -779,7 +810,50 @@ const isFiltering = computed(() =>
 );
 // A row's folder is worth showing only when the list can span folders.
 const showDocumentFolderPath = computed(() => hasFolders.value && isFiltering.value);
+// Browsing a folder lists its direct sub-folders as entries, the way a file
+// manager does. Filtering returns matching documents from the whole subtree,
+// so folder entries would be noise there.
+const visibleSubFolders = computed(() =>
+  isFiltering.value ? [] : childFolders(folderTree.value, selectedFolderPath.value),
+);
 const folderBreadcrumbs = computed(() => buildFolderBreadcrumbs(selectedFolderPath.value));
+// What the breadcrumb reports is the folder's own contents the way a file
+// manager counts them: the documents this list can show plus its direct
+// sub-folders, which the sidebar tree lists as rows. A recursive document total
+// here would not match what the page shows, so that number stays on the tree row
+// and in the empty state below. Filtering searches the subtree instead and
+// reports only the flat result set, so it adds no folder number.
+const folderContentsCount = computed<{ documents: number; folders: number }>(() => ({
+  documents: total.value,
+  folders: isFiltering.value ? 0 : childFolders(folderTree.value, selectedFolderPath.value).length,
+}));
+// A folder with no sub-folders would otherwise end the breadcrumb with
+// "/ 0 folders"; the document-only message is the whole truth there.
+const showFolderContentsCount = computed(
+  () => !isFiltering.value && folderContentsCount.value.folders > 0,
+);
+const folderContentsMessage = computed(() => ({
+  documents: folderContentsCount.value.documents,
+  folders: folderContentsCount.value.folders,
+  // vue-i18n selects the plural form from `count`; folders are the noun that
+  // changes with the number.
+  count: folderContentsCount.value.folders,
+}));
+// Documents below the selected folder rather than directly inside it; this is
+// what tells "documents live in the sub-folders" apart from "nothing here yet".
+const folderSubfolderDocumentCount = computed(() => {
+  const counts = folderDocumentCounts(folderTree.value, selectedFolderPath.value);
+  if (!counts) return 0;
+  return Math.max(0, counts.total - counts.direct);
+});
+// Which empty state the document list needs: a search without matches, a folder
+// whose documents are all below it, a plain empty folder, or the onboarding
+// panel for a knowledge base that has no folders at all.
+const folderEmptyState = computed<'search' | 'subfolders' | 'folder' | 'none'>(() => {
+  if (isFiltering.value) return 'search';
+  if (folderSubfolderDocumentCount.value > 0) return 'subfolders';
+  return hasFolders.value || selectedFolderPath.value ? 'folder' : 'none';
+});
 
 const filterParams = computed(() => {
   const [start, end] = updatedTimeRange.value || [];
@@ -1430,6 +1504,16 @@ const updateStatus = (analyzeList: KnowledgeCard[], delay = 1500) => {
             delete traceAvailableById[item.id];
             }
         });
+        // A requested row the batch no longer returns is gone (deleted
+        // elsewhere, replaced by a data-source sync). Left in the list it
+        // kept its in-flight status, so its spinner and this poll never ended.
+        const returnedIds = new Set((result.data as KnowledgeCard[]).map(item => item.id));
+        const goneIds = new Set(analyzeList.map(item => item.id).filter(id => !returnedIds.has(id)));
+        if (goneIds.size > 0) {
+          const before = cardList.value.length;
+          cardList.value = cardList.value.filter(card => !goneIds.has(card.id));
+          total.value = Math.max(0, total.value - (before - cardList.value.length));
+        }
       }
       if (shouldRefreshWikiStatus) {
         void fetchWikiStatusOnce();
@@ -1457,6 +1541,81 @@ const updateStatus = (analyzeList: KnowledgeCard[], delay = 1500) => {
 const closeDoc = () => {
   isCardDetails.value = false;
 };
+
+useAssistantDataChange((changes) => {
+  const targetKbId = kbId.value;
+  if (!targetKbId) return;
+  const relevant = changes.filter(change => change.ids.knowledgeBaseIds.includes(targetKbId)
+    || (['knowledge', 'chunk'].includes(change.area) && change.ids.knowledgeIds.some(id =>
+      cardList.value.some(item => item.id === id) || (isCardDetails.value && details.id === id)))
+    // ID-only operations may affect a document outside the loaded folder or page.
+    || (change.area === 'knowledge' && change.ids.knowledgeBaseIds.length === 0));
+  if (!relevant.length) return;
+  if (relevant.some(change => change.operation === 'knowledge_base.delete')) {
+    MessagePlugin.warning(t('knowledgeBase.assistantDeleted'));
+    handleNavigateToKbList();
+    return;
+  }
+  if (isCardDetails.value && relevant.some(change => change.ids.knowledgeIds.includes(details.id))) {
+    if (relevant.some(change => change.ids.knowledgeIds.includes(details.id)
+      && LEAVING_OPERATIONS.includes(change.operation))) {
+      closeDoc();
+    } else {
+      getCardDetails({ id: details.id });
+    }
+  }
+  const reload = () => {
+    if (!isCurrentKb(targetKbId)) return;
+    resetPage();
+    void loadKnowledgeFiles(targetKbId);
+    void loadFolderTree(targetKbId);
+    void loadTags(targetKbId, true);
+  };
+  if (relevant.some(change => change.area === 'knowledge_base')) {
+    resetPage();
+    void loadKnowledgeBaseInfo(targetKbId, true);
+  } else {
+    reload();
+  }
+  // Deletes and moves only start here; the list changes once they finish.
+  const loaded = new Set(cardList.value.map(item => item.id));
+  const leaving = new Set<string>();
+  const arriving = new Set<string>();
+  for (const change of relevant) {
+    if (!LEAVING_OPERATIONS.includes(change.operation) && change.operation !== 'knowledge.move') continue;
+    for (const id of change.ids.knowledgeIds) {
+      if (change.operation === 'knowledge.move' && !loaded.has(id)) arriving.add(id);
+      else leaving.add(id);
+    }
+  }
+  if (leaving.size || arriving.size) void settleThenReload(targetKbId, [...leaving], [...arriving], reload);
+}, { areas: ['knowledge_base', 'knowledge', 'chunk'] });
+
+const LEAVING_OPERATIONS = ['knowledge.delete', 'knowledge.batch_delete', 'knowledge.move'];
+
+const settleThenReload = async (
+  targetKbId: string, leaving: string[], arriving: string[], reload: () => void,
+) => {
+  const isActive = () => isCurrentKb(targetKbId);
+  const fetchRows = async (ids: string[]) => {
+    const query = new URLSearchParams();
+    ids.forEach(id => query.append('ids', id));
+    return await batchQueryKnowledge(query.toString(), targetKbId) as any;
+  };
+  try {
+    if (leaving.length) await waitForKnowledgeDeletion(leaving, fetchRows, { isActive });
+    for (let i = 0; arriving.length && i < 30 && isActive(); i++) {
+      const res = await fetchRows(arriving);
+      const present = new Set(((res?.data ?? []) as KnowledgeCard[]).map(row => row.id));
+      if (arriving.every(id => present.has(id))) break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  } catch {
+    // Reload whatever the server shows now.
+  }
+  reload();
+};
+
 const openCardDetails = (item: KnowledgeCard) => {
   isCardDetails.value = true;
   getCardDetails(item);
@@ -2257,29 +2416,17 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                 </template>
               </button>
               <t-icon name="chevron-right" class="breadcrumb-separator" />
-              <template v-if="isWiki">
-                <span :class="['breadcrumb-tab', { active: activeKbTab === 'documents' }]"
-                  @click="activeKbTab = 'documents'">{{ $t('knowledgeEditor.wikiBrowser.tabDocuments') }}</span>
-                <span class="breadcrumb-tab-sep">/</span>
-                <span :class="['breadcrumb-tab', { active: activeKbTab === 'wiki', indexing: wikiIsIndexing }]"
-                  @click="activeKbTab = 'wiki'">
-                  Wiki
-                  <t-tooltip v-if="wikiIsIndexing" :content="wikiIndexingTip" placement="bottom">
-                    <t-loading size="small" class="breadcrumb-tab-indicator" />
-                  </t-tooltip>
-                </span>
-                <span class="breadcrumb-tab-sep">/</span>
-                <t-tooltip :content="$t('knowledgeEditor.wikiBrowser.tabGraphTip')" placement="bottom">
-                  <span :class="['breadcrumb-tab', { active: activeKbTab === 'graph', indexing: wikiIsIndexing }]"
-                    @click="activeKbTab = 'graph'">
-                    {{ $t('knowledgeEditor.wikiBrowser.tabGraph') }}
-                    <t-tooltip v-if="wikiIsIndexing" :content="wikiIndexingTip" placement="bottom">
-                      <t-loading size="small" class="breadcrumb-tab-indicator" />
-                    </t-tooltip>
-                  </span>
+              <div class="kb-view-tabs" role="tablist" :aria-label="$t('knowledgeEditor.wikiBrowser.viewTabs')">
+                <t-tooltip v-for="tab in kbViewTabs" :key="tab.key" :content="tab.tip" placement="bottom">
+                  <button type="button" role="tab" class="kb-view-tab"
+                    :class="{ active: shownKbTab === tab.key, indexing: tab.indexing }"
+                    :aria-selected="shownKbTab === tab.key" @click="activeKbTab = tab.key">
+                    <t-loading v-if="tab.indexing" size="small" class="kb-view-tab__indicator" />
+                    <t-icon v-else :name="tab.icon" size="16px" />
+                    <span>{{ tab.label }}</span>
+                  </button>
                 </t-tooltip>
-              </template>
-              <span v-else class="breadcrumb-current">{{ $t('knowledgeEditor.document.title') }}</span>
+              </div>
             </h2>
             <!-- 标题行右侧的动作锚点：聚拢"信息"和"设置"两个圆形按钮。 -->
             <div class="kb-title-actions">
@@ -2293,7 +2440,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
             </div>
           </div>
           <p v-if="kbInfo?.description" class="document-subtitle">{{ kbInfo.description }}</p>
-          <p v-if="unsupportedFileTypes.length" class="parser-hint" @click="goToParserSettings">
+          <p v-if="canEdit && unsupportedFileTypes.length" class="parser-hint" @click="goToParserSettings">
             <t-icon name="info-circle" class="parser-hint-icon" />
             <span>{{$t('knowledgeBase.unsupportedTypesHint', {
               types: unsupportedFileTypes.map(t => '.' + t).join('、')
@@ -2316,7 +2463,12 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
           @view-graph="onViewWikiInGraph" />
       </div>
 
-      <template v-if="activeKbTab === 'documents' || !isWiki">
+      <!-- Image Gallery (4th tab) -->
+      <ImageGallery v-if="activeKbTab === 'gallery' && kbId" :knowledge-base-id="kbId" @open-source-doc="openSourceDoc" />
+
+      <!-- wiki/graph tabs only exist on wiki KBs; a stale tab (?tab= or one
+           carried over from a previous KB) falls back to documents. -->
+      <template v-if="activeKbTab === 'documents' || (!isWiki && activeKbTab !== 'gallery')">
         <div class="knowledge-main">
           <KbFolderTree v-if="showFolderTree && !folderTreeCollapsed" :tree="folderTree" :selected-path="selectedFolderPath"
             :loading="folderTreeLoading" :can-edit="canEdit" :root-label="kbInfo?.name"
@@ -2341,7 +2493,11 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                     <span v-if="index === folderBreadcrumbs.length - 1" class="doc-folder-path__crumb is-current" :title="crumb.name" aria-current="page">{{ crumb.name }}</span>
                     <button v-else type="button" class="doc-folder-path__crumb" :title="crumb.name" @click="handleFolderSelect(crumb.path)">{{ crumb.name }}</button>
                   </template>
-                  <span v-if="!docListLoading" class="doc-folder-path__count">{{ $t(isFiltering ? 'knowledgeBase.folderTree.filteredCount' : 'knowledgeBase.documentCount', { count: total }) }}</span>
+                  <span v-if="!docListLoading" class="doc-folder-path__count">
+                    <template v-if="isFiltering">{{ $t('knowledgeBase.folderTree.filteredCount', { count: folderContentsCount.documents }) }}</template>
+                    <template v-else-if="showFolderContentsCount">{{ $t('knowledgeBase.folderTree.folderContentsCount', folderContentsMessage) }}</template>
+                    <template v-else>{{ $t('knowledgeBase.documentCount', { count: folderContentsCount.documents }) }}</template>
+                  </span>
                   <t-tooltip v-if="showFolderTree && isFiltering" :content="$t('knowledgeBase.folderTree.searchingSubtree')">
                     <t-icon name="info-circle" class="doc-folder-path__sep" />
                   </t-tooltip>
@@ -2474,7 +2630,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
               </div>
               <div class="doc-scroll-container"
                 :class="{
-                  'is-empty': !cardList.length && !docListLoading,
+                  'is-empty': !cardList.length && !visibleSubFolders.length && !docListLoading,
                   'is-marquee-active': docMarqueeVisible,
                 }"
                 ref="knowledgeScroll" @scroll="handleScroll" @mousedown="onDocMarqueeMouseDown">
@@ -2502,10 +2658,11 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                     </div>
                   </div>
                 </div>
-                <template v-else-if="cardList.length && viewMode === 'grid'">
+                <template v-else-if="(cardList.length || visibleSubFolders.length) && viewMode === 'grid'">
                   <DocumentCardView :kb-id="kbId"
                     :items="cardList"
                     :folder-options="folderOptions"
+                    :sub-folders="visibleSubFolders"
                     :selected-ids="selectedIds"
                     :batch-mode="batchMode"
                     :can-edit="canEdit"
@@ -2532,8 +2689,9 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                     @update:move-mode="(mode: any) => moveMode = mode"
                   />
                 </template>
-                <template v-else-if="cardList.length && viewMode === 'list'">
+                <template v-else-if="(cardList.length || visibleSubFolders.length) && viewMode === 'list'">
                   <DocumentListView :kb-id="kbId" :items="cardList" :folder-options="folderOptions"
+                    :sub-folders="visibleSubFolders"
                     :selected-ids="selectedIds"
                     :can-edit="canEdit" :can-download="canDownloadKnowledge" :can-mutate-knowledge="canMutateKnowledge"
                     :trace-visible-ids="traceAvailableById"
@@ -2558,10 +2716,14 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                 </template>
                 <template v-else-if="!docListLoading">
                   <div class="doc-empty-state">
-                    <p v-if="hasFolders || selectedFolderPath || isFiltering" class="doc-empty-folder">
-                      {{ isFiltering
-                        ? $t('knowledgeBase.folderTree.emptySearch')
-                        : $t('knowledgeBase.folderTree.emptyFolder') }}
+                    <p v-if="folderEmptyState === 'search'" class="doc-empty-folder">
+                      {{ $t('knowledgeBase.folderTree.emptySearch') }}
+                    </p>
+                    <p v-else-if="folderEmptyState === 'subfolders'" class="doc-empty-folder">
+                      {{ $t('knowledgeBase.folderTree.emptyFolderWithSubfolders', { count: folderSubfolderDocumentCount }) }}
+                    </p>
+                    <p v-else-if="folderEmptyState === 'folder'" class="doc-empty-folder">
+                      {{ $t('knowledgeBase.folderTree.emptyFolder') }}
                     </p>
                     <EmptyKnowledge v-else />
                   </div>
@@ -2633,42 +2795,57 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
   box-sizing: border-box;
 }
 
-// Breadcrumb tab switch (文档/Wiki in breadcrumb)
-.breadcrumb-tab {
-  cursor: pointer;
-  color: var(--td-text-color-placeholder);
-  font-weight: 400;
-  transition: color var(--app-motion-fast);
+// View switch (文档 / Wiki / 图谱 / 画廊): a segmented control after the
+// breadcrumb, drawn like the documents tab's view toggle so the four views
+// read as siblings rather than as another breadcrumb level.
+.kb-view-tabs {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
+  margin-left: 2px;
+  padding: 3px;
+  border-radius: var(--app-radius-lg);
+  background: var(--td-bg-color-secondarycontainer);
+}
+
+.kb-view-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--app-radius-md);
+  background: transparent;
+  color: var(--td-text-color-secondary);
+  font-family: var(--app-font-family);
+  font-size: var(--app-text-base);
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color var(--app-motion-fast) ease, background-color var(--app-motion-fast) ease;
 
   &:hover {
     color: var(--td-text-color-primary);
   }
 
   &.active {
+    background: var(--td-bg-color-container);
     color: var(--td-brand-color);
     font-weight: 600;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 8%);
   }
 
-  &.indexing {
+  &:focus-visible {
+    outline: 2px solid var(--app-focus-border);
+    outline-offset: 1px;
+  }
+
+  &__indicator {
+    display: inline-flex;
     color: var(--td-brand-color);
   }
-}
-
-.breadcrumb-tab-indicator {
-  display: inline-flex;
-  align-items: center;
-  color: var(--td-brand-color);
-  font-size: var(--app-text-sm);
-  line-height: 1;
-}
-
-.breadcrumb-tab-sep {
-  margin: 0 6px;
-  color: var(--td-text-color-disabled);
-  font-weight: 400;
 }
 
 .wiki-main-area {
@@ -2726,16 +2903,28 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
   container-name: doc-card-area;
 }
 
-// One navigation row; filters open in a single anchored panel.
+// Wrap by content as well as pane width: long paths must not squeeze out actions.
 .doc-filter-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
   flex-shrink: 0;
   padding: 0 0 16px;
   border-bottom: 1px solid var(--td-component-stroke);
-  &__trailing { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  &__trailing {
+    display: flex;
+    flex: 0 1 auto;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    min-width: 0;
+    max-width: 100%;
+    margin-left: auto;
+    > :not(.doc-search-input) { flex-shrink: 0; }
+  }
   .doc-search-input { width: 220px; min-width: 100px; }
   :deep(.doc-search-input .t-input) {
     background: transparent;
@@ -2754,6 +2943,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
 }
 .doc-folder-path {
   display: flex;
+  flex: 1 1 auto;
   align-items: baseline;
   gap: 6px;
   min-width: 0;
@@ -3092,7 +3282,9 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
   .document-breadcrumb {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 6px;
+    row-gap: 8px;
     margin: 0;
     font-size: var(--app-text-3xl);
     font-weight: 600;
@@ -3110,6 +3302,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    white-space: nowrap;
     border-radius: var(--app-radius-sm);
     transition: all var(--app-motion-instant) ease;
 

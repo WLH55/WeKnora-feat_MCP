@@ -1,3 +1,39 @@
+# Build extension and daemon from the same pinned source on the runtime architecture.
+FROM --platform=$TARGETPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
+WORKDIR /build
+# Use the same optional Debian mirror as the Go builder and runtime stages.
+ARG APK_MIRROR_ARG
+# This base image has no CA certificates. Install them from the original HTTP
+# Debian source before swapping in a mirror: mirrors.tencent.com redirects
+# apt to HTTPS, and that handshake fails without a trust store.
+RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends ca-certificates && \
+        rm -rf /var/lib/apt/lists/* && \
+        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends git python3 ca-certificates curl build-essential cmake pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+# Optional rustup/crates mirror (e.g. https://rsproxy.cn) for networks where
+# static.rust-lang.org / crates.io transfers die mid-stream. Empty = official.
+ARG RUSTUP_MIRROR=""
+RUN if [ -n "$RUSTUP_MIRROR" ]; then \
+        export RUSTUP_DIST_SERVER="$RUSTUP_MIRROR" RUSTUP_UPDATE_ROOT="$RUSTUP_MIRROR/rustup" && \
+        mkdir -p "$CARGO_HOME" && \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
+            "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
+    fi && \
+    curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs && \
+    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable && \
+    rm -f /tmp/rustup-init.sh
+COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
+ARG TARGETOS
+ARG TARGETARCH
+RUN bash scripts/build_browserskill.sh /opt/weknora/browserskill "${TARGETOS}/${TARGETARCH}"
 # Build stage
 FROM golang:1.26-bookworm AS builder
 
@@ -72,49 +108,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         ./scripts/build-anydoc-lib.sh; \
     fi
 
-# Build the application with version info
+# Build the application with version info. Mount the Go build cache as well as
+# the module cache: `COPY . .` invalidates this layer on every source change,
+# and without the mount each rebuild regenerates the whole compile cache inside
+# the layer (~2.7 GB), which occupies disk locally and is uploaded to the CI
+# layer cache. Mounted, the cache lives outside the layer and repeated builds
+# reuse compiled objects instead of recompiling from scratch.
 RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
     if [ "$WITH_ANYDOC" = "1" ]; then \
         make build-prod GO_BUILD_TAGS=anydoc; \
     else \
         make build-prod; \
     fi
 RUN --mount=type=cache,target=/go/pkg/mod cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
-
-# Build the extension and compile the native daemon from the pinned source.
-# Node runs on the runtime architecture: the upstream script refuses to run
-# when host platform differs from target, so the Rust/cmake toolchain must
-# match the final image. Placed after the builder stage: the node slim base
-# ships without ca-certificates, and the apt mirror + rustup + git clone below
-# are all HTTPS, so the CA bundle is copied over from the builder first
-# (same chicken-and-egg as the final stage).
-FROM --platform=$TARGETPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS browserskill
-WORKDIR /build
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-ARG APK_MIRROR_ARG
-RUN if [ -n "$APK_MIRROR_ARG" ]; then \
-        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
-    fi && \
-    apt-get -o Acquire::Retries=5 update && \
-    apt-get -o Acquire::Retries=5 install -y --no-install-recommends git python3 ca-certificates curl build-essential cmake pkg-config && \
-    rm -rf /var/lib/apt/lists/*
-ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
-ENV PATH=/usr/local/cargo/bin:$PATH
-ARG RUSTUP_MIRROR=""
-RUN if [ -n "$RUSTUP_MIRROR" ]; then \
-        export RUSTUP_DIST_SERVER="$RUSTUP_MIRROR" RUSTUP_UPDATE_ROOT="$RUSTUP_MIRROR/rustup" && \
-        mkdir -p "$CARGO_HOME" && \
-        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
-            "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
-    fi && \
-    curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
-        -o /tmp/rustup-init.sh https://sh.rustup.rs && \
-    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable && \
-    rm -f /tmp/rustup-init.sh
-COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
-ARG TARGETOS
-ARG TARGETARCH
-RUN bash scripts/build_browserskill.sh /opt/weknora/browserskill "${TARGETOS}/${TARGETARCH}"
 
 # Final stage
 FROM debian:12.12-slim

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -75,6 +77,11 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		logger.Error(ctx, "Invalid file type")
 		return nil, ErrInvalidFileType
 	}
+
+	// JSON content validation stays in the HTTP upload handler (and
+	// ReplaceKnowledgeFile), not here: datasource sync may have already
+	// deleted the previous knowledge for this external_id, and IM swallows
+	// create errors — an early 400 would drop the document with no failed row.
 
 	// Calculate file hash for deduplication
 	logger.Info(ctx, "Calculating file hash")
@@ -1163,7 +1170,7 @@ func (s *knowledgeService) markKnowledgeEnqueueFailed(ctx context.Context, knowl
 
 func usesSourceIdentityDuplicateCheck(channel string) bool {
 	switch channel {
-	case types.ConnectorTypeGitLab, types.ChannelConfluence:
+	case types.ConnectorTypeGitLab, types.ChannelConfluence, types.ChannelSeafile:
 		return true
 	default:
 		return false
@@ -1277,25 +1284,95 @@ func (s *knowledgeService) bindStoredImages(
 	}
 }
 
+func (s *knowledgeService) bindChunkResources(
+	ctx context.Context, tenantID uint64, knowledgeID string, chunks []*types.Chunk,
+) {
+	if len(chunks) == 0 {
+		return
+	}
+	var b strings.Builder
+	for _, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		b.WriteString(chunk.Content)
+		b.WriteByte('\n')
+		b.WriteString(chunk.ImageInfo)
+		b.WriteByte('\n')
+	}
+	s.bindContentResources(ctx, tenantID, knowledgeID, b.String())
+}
+
 func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	kb *types.KnowledgeBase, knowledge *types.Knowledge, content string, doSync bool,
 ) error {
 	clean := strings.TrimSpace(content)
 	if clean == "" {
+		// The caller already marked the row processing; with nothing to
+		// index no later stage would ever move it on.
+		if err := s.repo.UpdateKnowledgeColumns(ctx, knowledge.ID, map[string]interface{}{
+			"parse_status":  types.ParseStatusFailed,
+			"error_message": "manual knowledge content is empty",
+			"updated_at":    time.Now(),
+		}); err != nil {
+			return fmt.Errorf("mark empty manual knowledge %s failed: %w", knowledge.ID, err)
+		}
 		return nil
 	}
 
 	// Resolve embedded data:base64 images and remote http(s) images → storage, replace URLs.
 	// Runs before chunking so chunks contain stable provider:// URLs.
 	var resolvedImages []docparser.StoredImage
+	var fileSvc interfaces.FileService
+	var inlineParseErr error
 	if s.imageResolver != nil {
-		fileSvc := s.resolveFileService(ctx, kb)
-		afterDataURI, fromDataURI, _ := s.imageResolver.ResolveDataURIImages(ctx, clean, fileSvc, knowledge.TenantID)
-		if len(fromDataURI) > 0 {
-			logger.Infof(ctx, "Resolved %d data-URI images for manual knowledge %s", len(fromDataURI), knowledge.ID)
-			clean = afterDataURI
-			resolvedImages = append(resolvedImages, fromDataURI...)
+		fileSvc = s.resolveFileService(ctx, kb)
+		updatedMarkdown, inlineImages, resolveErr := s.imageResolver.ResolveAndStore(ctx,
+			&types.ReadResult{MarkdownContent: clean}, fileSvc, knowledge.TenantID)
+		if errors.Is(resolveErr, docparser.ErrAmbiguousInlineImage) {
+			inlineParseErr = resolveErr
+			inlineImages = nil // ResolveAndStore already rolled back this attempt's uploads.
+		} else if resolveErr != nil {
+			retryCount, _ := asynq.GetRetryCount(ctx)
+			maxRetry, _ := asynq.GetMaxRetry(ctx)
+			if retried, limit, ok := types.TaskRetryMetadataFromContext(ctx); ok {
+				retryCount, maxRetry = retried, limit
+			}
+			if retryCount >= maxRetry {
+				knowledge.ParseStatus = types.ParseStatusFailed
+				knowledge.ErrorMessage = fmt.Sprintf("store manual inline image: %v", resolveErr)
+				knowledge.UpdatedAt = time.Now()
+				if updateErr := s.updateKnowledgeUnlessSourceReplaced(ctx, knowledge); updateErr != nil {
+					logger.Errorf(ctx,
+						"Failed to persist manual inline image failure for %s: %v", knowledge.ID, updateErr)
+				}
+			}
+			return fmt.Errorf("store manual inline image: %w", resolveErr)
 		}
+		if len(inlineImages) > 0 {
+			logger.Infof(ctx, "Resolved %d inline images for manual knowledge %s", len(inlineImages), knowledge.ID)
+		}
+		clean = updatedMarkdown
+		resolvedImages = append(resolvedImages, inlineImages...)
+	}
+	if inlineParseErr != nil || docparser.HasUnresolvedInlineImagePayload(clean) {
+		message := "unresolved inline image base64 payload remains before manual chunking"
+		if inlineParseErr != nil {
+			message = inlineParseErr.Error()
+		}
+		cleanupUnboundInlineImages(ctx, fileSvc, resolvedImages)
+		knowledge.ParseStatus = types.ParseStatusFailed
+		knowledge.ErrorMessage = message
+		knowledge.UpdatedAt = time.Now()
+		s.beginStage(ctx, knowledge.ID, types.StageChunking, nil)
+		s.failStage(ctx, knowledge.ID, types.StageChunking, werrors.ErrCodeChunkingFailed, message, nil)
+		if err := s.updateKnowledgeUnlessSourceReplaced(ctx, knowledge); err != nil {
+			return fmt.Errorf("%w: persist manual inline image failure: %v", asynq.SkipRetry, err)
+		}
+		return fmt.Errorf("%s: %w", message, asynq.SkipRetry)
+	}
+
+	if s.imageResolver != nil {
 		updatedContent, storedImages, resolveErr := s.imageResolver.ResolveRemoteImages(ctx, clean, fileSvc, knowledge.TenantID)
 		if resolveErr != nil {
 			logger.Warnf(ctx, "Remote image resolution partially failed: %v", resolveErr)
@@ -1332,9 +1409,10 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	chunkCfg := buildSplitterConfigFromChunking(eff.ChunkingConfig)
 
 	var parsed []types.ParsedChunk
+	multimodalImages := imagesForMultimodal(resolvedImages)
 	opts := ProcessChunksOptions{
-		EnableMultimodel: eff.EnableMultimodel && len(resolvedImages) > 0,
-		StoredImages:     resolvedImages,
+		EnableMultimodel: eff.EnableMultimodel && len(multimodalImages) > 0,
+		StoredImages:     multimodalImages,
 	}
 	if eff.QuestionGenerationConfig.Enabled {
 		opts.EnableQuestionGeneration = true

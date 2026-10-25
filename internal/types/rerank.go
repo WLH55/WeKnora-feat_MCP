@@ -1,6 +1,9 @@
 package types
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // RerankOptions is the per-request rerank control shared by the retrieval
 // APIs (knowledge-search and hybrid-search).
@@ -31,6 +34,9 @@ func (o *RerankOptions) IsEnabled() bool {
 func (o *RerankOptions) Validate() error {
 	if o != nil && o.TopK < 0 {
 		return errors.New("rerank.top_k must not be negative")
+	}
+	if o != nil && o.TopK > MaxRequestedResults {
+		return fmt.Errorf("rerank.top_k must not exceed %d", MaxRequestedResults)
 	}
 	return nil
 }
@@ -89,6 +95,11 @@ type RerankDiagnostics struct {
 	TopScore       float64 `json:"top_score"`
 	CandidateCount int     `json:"candidate_count"`
 	ResultCount    int     `json:"result_count"`
+	// ImagesScored counts image hits a multimodal reranker scored by their
+	// image; ImagesKept the pictorial image hits kept over a text reranker's
+	// rejection on their vector's evidence.
+	ImagesScored int `json:"images_scored,omitempty"`
+	ImagesKept   int `json:"images_kept,omitempty"`
 	// Error carries the reason for model_error / model_unavailable.
 	Error string `json:"error,omitempty"`
 }

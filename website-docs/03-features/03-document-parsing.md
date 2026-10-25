@@ -55,7 +55,7 @@ service DocReader {
 
 `ReadRequest` 是统一请求：设置 `file_content`/`file_name`/`file_type` 为文件模式，设置 `url`/`title` 为 URL 模式；`config.parser_engine` 指定引擎（`builtin` / `markitdown` / `opendataloader`），`config.parser_engine_overrides` 传递引擎级覆盖参数（如 `pdf_force_scanned`、`odl_hybrid`）。
 
-`ReadResponse` 返回 `markdown_content` + `repeated ImageRef image_refs`（图片以 **inline bytes** 内联返回，`image_dir_path` 恒为空字符串——图片持久化完全由 Go App 负责，proto 中原来的 `image_storage` 字段 3 已 `reserved`）。
+`ReadResponse` 返回 `markdown_content` + `repeated ImageRef image_refs`（图片以 **inline bytes** 内联返回，`image_dir_path` 恒为空字符串——图片持久化完全由 Go App 负责，proto 中原来的 `image_storage` 字段 3 已 `reserved`），以及可选的 `repeated SourceBlock source_blocks`：把 `markdown_content` 的一段（Unicode 码点偏移 `start`/`end`）映射回原文件中的位置（`locator_json`），用于引用定位，见[原文位置](#source-locators)。`ReadStreamMeta` 带同样的字段。
 
 `ReadStream` 的价值（见 `main.py::ReadStream` 与 `_iter_image_refs`）：每帧独立、体积小；服务端边解码 base64 边 `images.pop(ref_path)` 释放源数据，双方都不必同时持有全部图片，解决大扫描件 PDF 的峰值内存和消息尺寸问题。Go 侧 `internal/infrastructure/docparser/grpc_parser.go` 优先调用 `ReadStream`，遇到旧版本 docreader 返回 `Unimplemented` 时自动回退 unary `Read`。
 
@@ -202,10 +202,16 @@ sequenceDiagram
 三个辅助模块解决现实中的脏文件：
 
 - **`excel_convert.py`**：魔数/`inspect_excel_format` 检测真实格式（xlsx/xls/xlsb/ods），为每种格式选 pandas engine（`xlrd`/`openpyxl`/`odf`）；无法识别时（如 WPS `.et`、被改名的 csv）用 LibreOffice `convert-to xlsx` 归一化（`normalize_excel_bytes` 依次尝试 `.xlsx/.xls/.et/.csv` 后缀）。
-- **`xlsx_merge.py`**：`fill_merged_cells_xlsx` 解除合并单元格并把左上角主值**复制到覆盖区域的每个单元格**——openpyxl 只在左上角存值，pandas 会把其余读成 NaN，填充后按行分块的 RAG chunk 才能保留上下文。
+- **`xlsx_merge.py`**：`fill_merged_cells_xlsx` 解除合并单元格并把左上角主值**复制到覆盖区域的每个单元格**——openpyxl 只在左上角存值，pandas 会把其余读成 NaN，填充后按行分块的 RAG chunk 才能保留上下文。可选地**按显示格式物化百分比**（见下）。
 - **`xlsx_repair.py`**：修复常见 XLSX 打包问题——`sharedStrings.xml` 路径大小写/位置不规范时重命名归位；manifest 引用了 sharedStrings 但包内缺失且工作表只用 inline string 时，从 `[Content_Types].xml` 与 workbook rels 中剥掉引用，使 openpyxl 能读。
 
-XLSX 读取前统一走 `repair → fill_merged_cells` 预处理，并用 `header=None` + A/B/C 列字母作为稳定列名（xls 则先尝试首行做表头，遇 `Unnamed:` 列回退列字母）。
+**百分比格式**：Excel 的百分比是**显示格式而非存储值**——单元格实存 `0.61123366`，靠 `0.00%` 渲染成 `61.12%`，而 pandas/openpyxl 读的是原始值，格式被丢掉，于是 `61.12%` 变成 `0.6112`（**100 倍偏差**，财务报表类数据会直接把错数字喂给模型）。打开 `DOCREADER_XLSX_PERCENT_AS_TEXT`（或单次上传给 `parser_engine_overrides.xlsx_percent_as_text=true`，优先级高于环境变量）后，带百分比格式的数值单元格会被就地转成显示文本 `"61.12%"`（格式置 `General`），转换在**填合并单元格之前**完成——只有合并区域左上角带 `number_format`，被覆盖的格子是 `General`，先填合并会让第 2..n 行漏转。**只处理百分比**：货币/千分位只影响可读性（`1,234,567` 和 `1234567` 是同一个数），日期由 openpyxl 自动转 datetime。默认 **false**——开启后该单元格由数值变成字符串，会影响下游排序/计算，关闭时读取行为与升级前完全一致。
+
+格式识别仅转换可可靠渲染的数字百分比模式（含颜色及正数/负数/零分段）。转义或引号中的 `%` 是字面量，不会触发乘 100；条件、填充和其他复杂自定义格式保留原始值，避免错误缩放。字面量百分号单元格也不会触发行提示推断。
+
+同源文件偶尔有「一格忘了刷百分比格式」的单元格（如某财报 `D12` 折旧率 `0.0592` 格式为 `0.00_ ;[Red]\-0.00\ `）。把 `DOCREADER_XLSX_PCT_ROW_HINT_MIN` 设为 N（默认 **0=关闭**）后，同一行有 ≥N 个显式百分比格式单元格时，该行漏标的 `0<|v|<1` 数字也按百分比处理，每次命中打 INFO 日志可事后审计。
+
+XLSX 读取前统一走 `repair → fill_merged_cells` 预处理，并用 `header=None` + A/B/C 列字母作为稳定列名（xls 则先尝试首行做表头，遇 `Unnamed:` 列回退列字母）。百分比物化（若开启）发生在 `fill_merged_cells` 内部、填合并单元格之前。
 
 #### ppt_convert.py / pptx_media.py（.ppt / .pptx，服务于 markitdown 引擎） {#_3-5-ppt-convert-py-pptx-media-py-ppt-pptx-服务于-markitdown-引擎}
 
@@ -248,6 +254,7 @@ PPT 系列**没有独立解析器**，由 `MarkitdownParser` 处理，这两个�
 - `HTMLToMarkdownParser` 先用 `BeautifulSoup(content, "lxml")` 解码原始字节——先看 BOM 与 HTML 内的 charset 声明，再交给统一的 Markdown 转换；
 - HTML → Markdown 复用 `MHTMLParser.html_to_markdown()`，但传入 `extract_images=False`（本地 HTML 文件没有 MIME 附件可抽）、`strip_internal_links=False`（保留站内链接）、`fallback_to_raw_html=False`（转换不出内容时返回空而不是塞一整块 ```` ```html ````）；
 - 正文中通过 `<img src="http://...">` 引用的远程图片由 Go 侧补齐：`internal/infrastructure/docparser/image_resolver.go` 会带 SSRF 校验下载这些远程图片并转存到对象存储，再重写引用，使其与本地上传的图片走同一套 OCR / caption 流程。
+- 默认整页转换，导航栏 / 侧栏 / 页脚也会进入索引。设 `DOCREADER_HTML_MAIN_CONTENT=true` 后改用 trafilatura 只抽正文（与 URL 导入路径同一策略），抽取结果过短（< 250 字符）、不足整页转换的 15%，或抽取器额外重复正文段落时回退整页转换。该开关默认关闭，升级不会改变既有文档的索引内容。 正文图片引用会保留在 Markdown 中，供 Go 侧解析；Python 侧不会下载远程图片。
 
 #### xmind_parser.py — XMindParser（.xmind 思维导图）
 
@@ -307,11 +314,27 @@ docreader 侧的图片契约非常简单：每个解析器把图片以 `Document
 - unary `Read`：`_resolve_images()` 把全部图片 base64 解码为 `ImageRef.image_data` **内联字节**一次性返回（`image_dir_path` 恒为空——历史上"写共享卷目录"的模式已废弃，注释明确 *"The Go App is solely responsible for persisting images to the configured storage backend (local/minio/cos/tos)"*）；
 - streaming `ReadStream`：`_iter_image_refs()` 逐张 yield，边发边 `pop` 释放内存。
 
-Go 侧接手后（`internal/infrastructure/docparser/image_resolver.go`）：将 inline bytes 上传对象存储、把 markdown 中的 `images/...` 引用重写为存储 URL；随后 `internal/application/service/image_multimodal.go` 依据 metadata 的 `image_source_type` 决策——`scanned_pdf` 的整页图走 OCR（带专用 `ocr_prompt`），普通插图走 VLM caption。知识库配置的图片解析自定义指令（`vlm_config.custom_instructions`）只追加到 caption 提示词，不进入 OCR 提示词，以免干扰 OCR 的输出约定（如无文字图片应回复 `No text content`）。
+Go 侧接手后（`internal/infrastructure/docparser/image_resolver.go`）：将 inline bytes 上传对象存储、把 markdown 中的 `images/...` 引用重写为存储 URL；随后 `internal/application/service/image_multimodal.go` 依据 metadata 的 `image_source_type` 决策——`scanned_pdf` 的整页图走 OCR（带专用 `ocr_prompt`），普通插图走 VLM caption。该服务有两条管线（处理轨迹里 `pipeline` 分别记为 `caption_ocr` / `observation_driven`）：历史管线（KB 未开启 `image_attrs_enabled`）对每张图各发一次描述、各发一次 OCR；属性观察管线（开启后）第一轮先用同一张图的「属性观察＋描述」结果确定属性（`contain.text` / `contain.data_visual`），再由代码纯函数 `DecideOCR` 按 KB 的 `image_actions` 决定该图是否值得再跑 OCR——`contain.text ∈ {sparse, none}` 且已确认观察、且 `data_visual == false` 的图默认只留描述、不花 OCR。两条管线的**图片理解都在 Go 侧**。知识库配置的图片解析自定义指令（`vlm_config.custom_instructions`）只追加到描述提示词（属性观察管线里即「属性观察＋描述」提示词），不进入 OCR 提示词，以免干扰 OCR 的输出约定（如无文字图片应回复 `No text content`）。
 
 各解析引擎输出中的内联 HTML `<table>`（常见于 MinerU、PaddleOCR-VL 与 VLM OCR）会在分块前统一转换为 Markdown 表格；含合并单元格等无法转换的表格保留 HTML，但每行单独成行，保证分块器能在行边界切分。**docreader 内没有任何 VLM 调用**；`models/read_config.py` 中的 `vlm_config`/`storage_config` 字段只是为了老构造函数签名兼容而保留的空壳（"Legacy config kept for backward compatibility"）。
 
 ---
+
+### 原文位置（source locators） {#source-locators}
+
+每个分块入库时带一组 `source_locators`，记录它在原始文件中的位置，对话里点击引用就能打开原文并高亮（见[会话与对话体验](18-chat-experience.md#查看回答与来源)）。位置信息按解析引擎分别产生，统一先表达为 Markdown 区间到原文位置的映射（source block），分块后再按区间求交得到每个分块的 locator：
+
+| 来源 | 产生方式 | locator |
+| --- | --- | --- |
+| builtin PDF（`pdf_parser.py`） | 文字页用 pdfium 字形坐标分栏成行，再按行距、列表编号、句末短行分段，每段一个框；扫描页和嵌入图只记页码 | `pdf`：`page` + `bbox` |
+| MinerU（自建 / 云端 / V1） | 读取返回的 `content_list`（`page_idx` + 0–1000 归一化 `bbox`），与 Markdown 按文本对齐；仅 PDF 与图片 | `pdf`：`page` + `bbox` |
+| PaddleOCR-VL（自建 / 云端） | 逐页结果的版面块（`prunedResult.parsing_res_list`），无版面块时按页 | `pdf`：`page`（+ `bbox`） |
+| Word / PPT / Excel / CSV / EPUB（任意引擎） | Go 侧读取原文件结构（docx 正文段落与表格、pptx 幻灯片文本、工作表行、EPUB 书脊章节），与解析器输出的 Markdown 按文本对齐，不依赖具体引擎 | `docx`：`block`；`slide`：`slide`；`sheet`：`sheet` + `row_start`/`row_end`；`section`：`section` |
+| builtin Excel（`excel_parser.py`） | 直接记录每行的工作表名与行号 | `sheet` |
+| Markdown / TXT（原样透传） | 按段落记录原文字符区间 | `text`：`start`/`end` |
+| 音频 | 语音识别返回分段时间时，转写按分段逐行输出并记录时间 | `time`：`start_ms`/`end_ms` |
+
+对齐只比较字母和数字，与 Markdown 语法、空白、标点无关；解析结果在 Go 侧还会经过换行规范化、HTML 表格转换、图片地址重写，块的区间会按行比对重新映射到最终文本。每个 locator 带 `quote`（被引用文字，最多 300 字），前端据此在渲染出的原文中精确查找，并挑出与回答句子最相符的段落。旧版本 doc/ppt/xls 与网页没有结构位置，前端回退为文本查找或打开原网页。
 
 ### splitter/ 分块器与 Go 侧 chunker 的关系 {#_5-splitter-分块器与-go-侧-chunker-的关系}
 
@@ -342,6 +365,7 @@ gRPC 响应中不再返回 chunks（`ReadResponse` 没有 chunk 字段）；`Exc
 | `DOCREADER_ODL_HYBRID_MODE` | `auto` | hybrid 模式参数 |
 | `DOCREADER_ODL_HYBRID_FALLBACK` | false | hybrid 失败是否回退 |
 | `DOCREADER_ODL_MARKDOWN_WITH_HTML` | false | ODL markdown 允许 HTML |
+| `DOCREADER_HTML_MAIN_CONTENT` | false | 上传 HTML 只索引正文（trafilatura 抽取，失败回退整页转换） |
 | `DOCREADER_PDF_RENDER_MAX_WORKERS` | 1 | PDF 渲染阶段限流（跨请求） |
 | `DOCREADER_PDF_RENDER_PARALLELISM` | `min(4, cpu)` | 单个 PDF 内扫描页渲染的 worker 进程数 |
 | `DOCREADER_PDF_RENDER_DPI` | 200 | 扫描页渲染 DPI |
@@ -364,6 +388,7 @@ gRPC 响应中不再返回 chunks（`ReadResponse` 没有 chunk 字段）；`Exc
 | `DOCREADER_PDF_FILTER_HIDDEN_TEXT` | true | 过滤不可见/页外文本（防 prompt injection） |
 | `DOCREADER_PDF_SANITIZE_TEXT` / `_STRIP_CHART_DEBRIS` | true | 清理占位字符 / 图表碎屑行 |
 | `DOCREADER_PDF_RENDER_VECTOR_FIGURES` | true | 将矢量图表区域渲染为 JPEG |
+| `DOCREADER_PDF_SOURCE_BOXES` | true | 记录文字页每段在页面上的框（引用高亮用）；关闭后只记页码，省去一次逐字坐标读取 |
 | `DOCREADER_PDF_WORD_GAP_WIDTH_RATIO` / `_MARGIN_COL_WIDTH_RATIO` / `_MIN_HEADING_LINE_CHARS` 等 | 0.4 / 0.12 / 8 | 版面重建微调参数（详见源码常量区） |
 
 #### Go 侧解析超时
@@ -375,8 +400,12 @@ gRPC 响应中不再返回 chunks（`ReadResponse` 没有 chunk 字段）；`Exc
 | `WEKNORA_DOCUMENT_PROCESS_TIMEOUT` | Go duration | `2h` | 单个文档处理任务的总超时 |
 | `WEKNORA_DOCREADER_CALL_TIMEOUT` | Go duration | `30m` | 单次 docreader 调用超时，须小于文档处理超时 |
 | `WEKNORA_PADDLEOCR_VL_TIMEOUT` | Go duration | `1000s` | 自建 PaddleOCR-VL 引擎的 HTTP 请求超时；空值、无效值或非正数使用默认值 |
+| `WEKNORA_MINERU_TIMEOUT` | Go duration | `1000s` | 自建 MinerU 引擎的单次解析超时（V1 API 覆盖上传到下载的整个任务，旧版覆盖 `/file_parse` 请求）；空值、无效值或非正数使用默认值 |
+| `WEKNORA_MINERU_CLOUD_TIMEOUT` | Go duration | `600s` | MinerU 云端（mineru.net）轮询解析结果的最长时间；空值、无效值或非正数使用默认值 |
+| `WEKNORA_PADDLEOCR_VL_CLOUD_TIMEOUT` | Go duration | `600s` | PaddleOCR-VL 云端（AI Studio）轮询解析结果的最长时间；空值、无效值或非正数使用默认值 |
+| `WEKNORA_WEKNORACLOUD_TIMEOUT` | Go duration | `20m` | WeKnoraCloud 托管 docreader 轮询任务结果的最长时间，应小于 `WEKNORA_DOCREADER_CALL_TIMEOUT`；空值、无效值或非正数使用默认值 |
 
-处理大文件时从内到外逐级留出余量，例如 PaddleOCR-VL `90m`、docreader `100m`、文档处理 `2h`。
+处理大文件时从内到外逐级留出余量，例如 PaddleOCR-VL 或 MinerU `90m`、docreader `100m`、文档处理 `2h`。
 
 #### 安全与其他 {#_6-3-安全与其他}
 
@@ -395,7 +424,7 @@ gRPC 响应中不再返回 chunks（`ReadResponse` 没有 chunk 字段）；`Exc
 
 #### 镜像与系统依赖（docker/Dockerfile.docreader） {#_7-1-镜像与系统依赖-docker-dockerfile-docreader}
 
-基础镜像 `python:3.10.18-bookworm`，双阶段构建（builder 用 `uv sync --locked` 装依赖 + `scripts/generate_proto.sh` 生成 pb 代码；runner 拷贝 venv），`EXPOSE 50051`，`CMD ["uv", "run", "-m", "docreader.main"]`。运行阶段系统依赖：
+基础镜像 `python:3.10.18-bookworm`，双阶段构建（builder 用 `uv sync --locked` 装依赖 + `docreader/scripts/generate_proto.sh` 生成 pb 代码；runner 拷贝 venv），`EXPOSE 50051`，`CMD ["uv", "run", "-m", "docreader.main"]`。运行阶段系统依赖：
 
 - **LibreOffice**（doc→docx、ppt→pptx、异常表格→xlsx 转换）+ 一串 X/字体库（libxinerama1、libfontconfig1、libcairo2、libcups2 等）；
 - **antiword**（.doc 纯文本兜底）；
@@ -484,7 +513,7 @@ V1 流程的几个细节：
 
 - 上传时附带 `sha256sum`，服务端已有相同文件时直接复用，不再传字节。
 - 只有 `upload_url` 与 `mineru_endpoint` 同源（scheme、host、端口都相同）时才附带 API Key；跨源地址（如官方 API 下发的预签名对象存储 URL）不带 Key，并照常经过 SSRF 校验。
-- 轮询从 2 秒开始指数退避，最长 30 秒一次；总时长与旧版一样是 1000 秒。超时或调用方取消时，会发 `DELETE /v1/parse/jobs/{id}` 取消服务端任务。
+- 轮询从 2 秒开始指数退避，最长 30 秒一次；总时长与旧版一样默认 1000 秒，可用 `WEKNORA_MINERU_TIMEOUT` 调整。超时或调用方取消时，会发 `DELETE /v1/parse/jobs/{id}` 取消服务端任务。
 - MinerU V1 服务的上传、任务状态都存在进程内存里，服务重启后正在轮询的任务会返回 404，本次解析直接失败。
 - 「测试连接」在 V1 服务上额外请求一次需要鉴权的 `GET /v1/parse/jobs?limit=1`，用来发现 API Key 缺失或错误（`/v1/health` 本身不校验 Key）。
 
