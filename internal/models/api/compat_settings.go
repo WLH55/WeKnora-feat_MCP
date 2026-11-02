@@ -103,10 +103,14 @@ type OpenAICompletionsSettings struct {
 	SupportsResponseFormat    bool
 	// SupportsMultiContent false flattens image/text parts to plain text.
 	SupportsMultiContent bool
-	// SupportsImageDetail gates the OpenAI-specific image_url detail
-	// parameter: when false the field is omitted from every image part
-	// (the empty value is dropped by the omitempty wire tag), so vendors
-	// that reject or ignore detail keep the provider default resolution.
+	// SupportsImageDetail gates the image_url detail field. detail is an
+	// OpenAI-specific parameter that defaults to "auto" server-side, so
+	// omitting it is semantically identical for compliant APIs — while strict
+	// OpenAI-compatible gateways reject the field outright (MiniMax answers
+	// HTTP 400 "invalid image detail: auto", error 2013, also reachable
+	// through third-party proxies). Only vendors verified to accept it
+	// declare it; an omitted field never reaches the wire
+	// (json:"detail,omitempty").
 	SupportsImageDetail bool
 	// ReplayReasoningContent sends reasoning_content on prior assistant turns.
 	ReplayReasoningContent bool

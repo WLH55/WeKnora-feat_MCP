@@ -34,6 +34,7 @@ services:
         - APK_MIRROR_ARG=${APK_MIRROR_ARG:-}
         - GOPROXY_ARG=${GOPROXY:-https://goproxy.cn,direct}
         - WITH_ANYDOC=${WITH_ANYDOC:-1}
+        - RUSTUP_MIRROR=${RUSTUP_MIRROR:-}
         # Build metadata shown on the system-info page. start_all.sh injects
         # these from git and the VERSION file; with a plain `docker compose
         # build` leave them unset (version falls back to the VERSION file,
@@ -440,6 +441,7 @@ services:
       dockerfile: docker/Dockerfile.docreader
       args:
         - APT_MIRROR=${APT_MIRROR:-}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-}
         - PLAYWRIGHT_DOWNLOAD_HOST=${PLAYWRIGHT_DOWNLOAD_HOST:-}
         - PLAYWRIGHT_WEBKIT_DOWNLOAD_HOST=${PLAYWRIGHT_WEBKIT_DOWNLOAD_HOST:-}
         - VERSION_ARG=${DOCREADER_VERSION:-unknown}

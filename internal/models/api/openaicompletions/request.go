@@ -78,6 +78,18 @@ type wireImageURL struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+// imageDetailField passes the requested image_url detail through only when
+// the vendor accepts the field; detail is OpenAI-specific and strict
+// OpenAI-compatible gateways reject it (MiniMax error 2013). An empty result
+// is dropped from the wire payload (json:"detail,omitempty") and the
+// vendor's server-side default — "auto" per the OpenAI spec — applies.
+func imageDetailField(s api.OpenAICompletionsSettings, detail string) string {
+	if !s.SupportsImageDetail {
+		return ""
+	}
+	return detail
+}
+
 // convertMessages maps neutral messages onto Chat Completions messages.
 func (c *Client) convertMessages(messages []api.Message) []wireMessage {
 	s := c.cfg.Settings
@@ -102,12 +114,9 @@ func (c *Client) convertMessages(messages []api.Message) []wireMessage {
 					parts = append(parts, wirePart{Type: "text", Text: part.Text})
 				case "image_url":
 					if part.ImageURL != nil {
-						detail := ""
-						if s.SupportsImageDetail {
-							detail = part.ImageURL.Detail
-						}
 						parts = append(parts, wirePart{Type: "image_url", ImageURL: &wireImageURL{
-							URL: api.ResolveImageURLForLLM(part.ImageURL.URL), Detail: detail,
+							URL:    api.ResolveImageURLForLLM(part.ImageURL.URL),
+							Detail: imageDetailField(s, part.ImageURL.Detail),
 						}})
 					}
 				}
@@ -116,12 +125,8 @@ func (c *Client) convertMessages(messages []api.Message) []wireMessage {
 		case len(msg.Images) > 0 && msg.Role == "user":
 			parts := make([]wirePart, 0, len(msg.Images)+1)
 			for _, img := range msg.Images {
-				detail := ""
-				if s.SupportsImageDetail {
-					detail = "auto"
-				}
 				parts = append(parts, wirePart{Type: "image_url", ImageURL: &wireImageURL{
-					URL: api.ResolveImageURLForLLM(img), Detail: detail,
+					URL: api.ResolveImageURLForLLM(img), Detail: imageDetailField(s, "auto"),
 				}})
 			}
 			parts = append(parts, wirePart{Type: "text", Text: msg.Content})

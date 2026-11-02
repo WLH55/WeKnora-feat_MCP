@@ -49,13 +49,30 @@ ENV BUILD_TIME=${BUILD_TIME_ARG}
 # engine; pass WITH_ANYDOC=0 to skip the Rust toolchain (~few minutes and
 # ~1 GB of build-stage layers).
 ARG WITH_ANYDOC=1
+# Optional rustup/crates mirror (e.g. https://rsproxy.cn) for networks where
+# static.rust-lang.org / crates.io transfers die mid-stream. Empty = official.
+ARG RUSTUP_MIRROR=""
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     if [ "$WITH_ANYDOC" = "1" ]; then \
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable && \
+        if [ -n "$RUSTUP_MIRROR" ]; then \
+            export RUSTUP_DIST_SERVER="$RUSTUP_MIRROR" RUSTUP_UPDATE_ROOT="$RUSTUP_MIRROR/rustup" && \
+            mkdir -p "$CARGO_HOME" && \
+            printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
+                "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
+        fi && \
+        rustup_ok=0; \
+        for attempt in 1 2 3; do \
+            if curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
+                    -o /tmp/rustup-init.sh https://sh.rustup.rs \
+               && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
+                rustup_ok=1; break; \
+            fi; \
+            echo "rustup bootstrap attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
+            sleep 5; \
+        done; rm -f /tmp/rustup-init.sh; [ "$rustup_ok" = "1" ] && \
         ./scripts/build-anydoc-lib.sh; \
     fi
 
@@ -98,7 +115,25 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
 # The daemon is compiled from source; the slim base ships no Rust toolchain.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+# Optional rustup/crates mirror (e.g. https://rsproxy.cn) for networks where
+# static.rust-lang.org / crates.io transfers die mid-stream. Empty = official.
+ARG RUSTUP_MIRROR=""
+RUN if [ -n "$RUSTUP_MIRROR" ]; then \
+        export RUSTUP_DIST_SERVER="$RUSTUP_MIRROR" RUSTUP_UPDATE_ROOT="$RUSTUP_MIRROR/rustup" && \
+        mkdir -p "$CARGO_HOME" && \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s/index/"\n' \
+            "$RUSTUP_MIRROR" > "$CARGO_HOME/config.toml"; \
+    fi && \
+    rustup_ok=0; \
+    for attempt in 1 2 3; do \
+        if curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-all-errors \
+                -o /tmp/rustup-init.sh https://sh.rustup.rs \
+           && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable; then \
+            rustup_ok=1; break; \
+        fi; \
+        echo "rustup bootstrap attempt ${attempt}/3 died on a flaky link; downloads resume, retrying"; \
+        sleep 5; \
+    done; rm -f /tmp/rustup-init.sh; [ "$rustup_ok" = "1" ]
 COPY scripts/build_browserskill.sh scripts/browserskill-release.json ./scripts/
 ARG TARGETOS
 ARG TARGETARCH

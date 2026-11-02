@@ -65,8 +65,30 @@ RUN if [ -z "$TARGETARCH" ]; then \
 
 # 复制依赖文件
 COPY docreader/pyproject.toml docreader/uv.lock ./
-RUN pip install uv --break-system-packages && \
-    python -m uv sync --locked --no-dev
+# PyPI 镜像：pip 读 PIP_INDEX_URL（ARG 自动注入 RUN 环境）。uv.lock 把官方
+# 源 URL（含 1000+ 条 files.pythonhosted.org 文件直链）写死在锁文件里，
+# UV_DEFAULT_INDEX 只影响解析、不影响冻结安装，直链在受限网络下会被掐断。
+# 走镜像时把锁文件里的源与文件直链原地改写为镜像路径（常见约定：
+# …/pypi/simple ↔ …/pypi/packages），版本与哈希校验仍由锁文件锁定。
+ARG PIP_INDEX_URL=""
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "$PIP_INDEX_URL" ]; then \
+        export UV_DEFAULT_INDEX="$PIP_INDEX_URL"; \
+        pkg_base="${PIP_INDEX_URL%/simple}"; \
+        sed -i "s|https://files.pythonhosted.org/packages/|${pkg_base}/packages/|g; s|https://pypi.org/simple|${PIP_INDEX_URL}|g" uv.lock; \
+        uv_sync_flags="--frozen"; \
+    else \
+        uv_sync_flags="--locked"; \
+    fi && \
+    export UV_HTTP_TIMEOUT=120 UV_CONCURRENT_DOWNLOADS=4 UV_CACHE_DIR=/root/.cache/uv && \
+    pip install uv --break-system-packages && \
+    sync_ok=0; \
+    for attempt in 1 2 3; do \
+        if python -m uv sync $uv_sync_flags --no-dev; then sync_ok=1; break; \
+        else echo "uv sync attempt ${attempt}/3 failed on a flaky link; cached wheels survive, retrying"; \
+             [ "$attempt" -lt 3 ] && sleep 5; fi; \
+    done; \
+    [ "$sync_ok" = "1" ]
 
 # 复制源代码和生成脚本
 COPY docreader docreader
