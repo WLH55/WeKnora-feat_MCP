@@ -61,10 +61,31 @@ func SanitizeToolDataForClient(toolName string, data map[string]interface{}) map
 		omit = persistStripFieldsByTool[toolName]
 	}
 	out := sanitizeToolData(data, omit)
-	if toolName != ToolRunOperation {
+	if !dataChangeTools[toolName] {
 		delete(out, "data_change")
 	}
 	return out
+}
+
+// dataChangeTools may tell live clients what they changed, so open pages
+// reload it.
+var dataChangeTools = map[string]bool{
+	ToolRunOperation:    true,
+	ToolWikiWritePage:   true,
+	ToolWikiReplaceText: true,
+	ToolWikiRenamePage:  true,
+	ToolWikiDeletePage:  true,
+	ToolWikiUpdateIssue: true,
+}
+
+// wikiDataChange names the knowledge base whose Wiki a tool changed, in the
+// shape run_operation reports its changes.
+func wikiDataChange(action, kbID string) map[string]any {
+	return map[string]any{
+		"operation": "wiki." + action,
+		"area":      "wiki",
+		"ids":       map[string][]string{"knowledge_base_id": {kbID}},
+	}
 }
 
 func sanitizeToolData(data map[string]interface{}, extraOmit []string) map[string]interface{} {
@@ -209,7 +230,10 @@ func compactHistoricalSandboxOutput(output string) string {
 	kept := historicalSandboxOutputChars - len(marker)
 	head := kept / 4
 	tail := kept - head
-	return output[:head] + marker + output[len(output)-tail:]
+	// Cut at the byte offsets, dropping a multi-byte character a cut splits:
+	// invalid UTF-8 reaches history replay as U+FFFD.
+	return strings.ToValidUTF8(output[:head], "") + marker +
+		strings.ToValidUTF8(output[len(output)-tail:], "")
 }
 
 func compactSandboxStreamFields(data map[string]interface{}) {
@@ -254,7 +278,8 @@ func compactShellExecHeadline(data map[string]interface{}) string {
 	}
 	const maxCmd = 240
 	if len(cmd) > maxCmd {
-		cmd = cmd[:maxCmd] + "..."
+		// Cut at maxCmd bytes, dropping a multi-byte character the cut splits.
+		cmd = strings.ToValidUTF8(cmd[:maxCmd], "") + "..."
 	}
 	return fmt.Sprintf("shell_exec exit=%d command=%s", exit, cmd)
 }

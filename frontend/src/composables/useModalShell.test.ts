@@ -53,6 +53,7 @@ function fixture() {
       useDeploymentCapabilitiesStore: () => ({ isSupported: () => true, async ensureLoaded() {} }),
     },
     '@/api/agent': { listIMChannels: async () => ({ data: [] }) },
+    '@/api/assistant': { ASSISTANT_ACCESS_LEVELS: ['read_only', 'confirm', 'auto_write'] },
     '@/api/embed': { listEmbedChannels: async () => ({ data: [] }) },
     '@/api/skill': {},
     '@/api/system': { isNamedSandboxBackend: () => true },
@@ -76,6 +77,7 @@ function fixture() {
     })
     return exports
   }
+  modules['@/composables/useAssistantPageContext'] = { useAssistantPageContext() {} }
   modules['@/composables/useModalShell'] = evaluate(readFileSync(new URL('./useModalShell.ts', import.meta.url), 'utf8'))
   modules['@/utils/assistantDataChange'] = evaluate(readFileSync(new URL('../utils/assistantDataChange.ts', import.meta.url), 'utf8'))
   function mount(path: string, props: Record<string, any>) {
@@ -90,7 +92,7 @@ function fixture() {
     app.mount({})
     return { vm: instance.value, unmount: () => { app.unmount(); assert.deepEqual(errors, []) } }
   }
-  return { mount, dialogs, resources, ui, warnings, emit: modules['@/utils/assistantDataChange'].emitAssistantDataChange }
+  return { mount, dialogs, resources, chat, ui, warnings, emit: modules['@/utils/assistantDataChange'].emitAssistantDataChange }
 }
 
 async function settle() {
@@ -98,6 +100,29 @@ async function settle() {
   await new Promise<void>(resolve => setImmediate(resolve))
   await vue.nextTick()
 }
+
+test('agent creation prefills vision and ASR defaults without enabling uploads or replacing explicit choices', async () => {
+  const f = fixture()
+  f.chat.allModels.push(
+    { id: 'vision', type: 'VLLM', is_default: true, capabilities: { thinking_levels: [] } },
+    { id: 'asr', type: 'ASR', is_default: true, capabilities: { thinking_levels: [] } },
+  )
+  const props = vue.reactive({ visible: false, mode: 'create' })
+  const { vm, unmount } = f.mount('../views/agent/AgentEditorModal.vue', props)
+  try {
+    props.visible = true
+    await settle()
+    assert.equal(vm.formData.config.vlm_model_id, 'vision')
+    assert.equal(vm.formData.config.asr_model_id, 'asr')
+    assert.ok(!vm.formData.config.image_upload_enabled)
+    assert.ok(!vm.formData.config.audio_upload_enabled)
+    vm.formData.config.vlm_model_id = 'explicit-vision'
+    vm.formData.config.asr_model_id = 'explicit-asr'
+    vm.applyDefaultModelsIfEmpty()
+    assert.equal(vm.formData.config.vlm_model_id, 'explicit-vision')
+    assert.equal(vm.formData.config.asr_model_id, 'explicit-asr')
+  } finally { unmount() }
+})
 
 for (const mode of ['edit', 'create'] as const) {
   test(`${mode}: initialization stays clean, while real edits require confirmation`, async () => {
@@ -181,7 +206,7 @@ for (const savedRules of [[], [{ file_types: ['xlsx'], engine: 'builtin', xlsx_f
     try {
       release()
       await settle()
-      assert.equal(vm.getEngineForGroup(['pdf']), 'anydoc', 'defaults are still displayed')
+      assert.equal(vm.getEngineForGroup(['pdf']), 'builtin', 'defaults are still displayed')
       assert.equal(updates.length, 0, 'loading must not mutate the parent form')
       f.ui.showSettingsModal = true
       await vue.nextTick()
@@ -203,6 +228,62 @@ for (const savedRules of [[], [{ file_types: ['xlsx'], engine: 'builtin', xlsx_f
     } finally { unmount() }
   })
 }
+
+// Engine FileTypes copied from internal/infrastructure/docparser/engines.go, so
+// a drift between the registry and the frontend default routing shows up here
+// rather than as a "(default)" badge that fails on upload.
+const registryEngines = [
+  {
+    Name: 'builtin', Available: true,
+    FileTypes: ['docx', 'doc', 'pdf', 'md', 'markdown', 'xlsx', 'xls', 'pptx', 'ppt', 'epub',
+      'html', 'htm', 'mhtml', 'xmind', 'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'webp',
+      'mp3', 'wav', 'm4a', 'flac', 'ogg'],
+  },
+  {
+    Name: 'simple', Available: true,
+    FileTypes: ['md', 'markdown', 'txt', 'csv', 'json', 'jpg', 'jpeg', 'png', 'gif', 'bmp',
+      'tiff', 'webp', 'mp3', 'wav', 'm4a', 'flac', 'ogg'],
+  },
+  { Name: 'anydoc', Available: true, FileTypes: ['docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt', 'pdf'] },
+  { Name: 'markitdown', Available: true, FileTypes: ['docx', 'pptx', 'ppt'] },
+]
+
+async function mountParserSettings(engines: any[]) {
+  const f = fixture()
+  f.resources.parserEngines = engines
+  const props = vue.reactive({ parserEngineRules: [], 'onUpdate:parserEngineRules': () => {} })
+  const { vm, unmount } = f.mount('../views/knowledge/settings/KBParserSettings.vue', props)
+  await settle()
+  return { vm, unmount }
+}
+
+test('the default engine badge follows the backend per-type routing', async () => {
+  const { vm, unmount } = await mountParserSettings(registryEngines)
+  try {
+    // PDF is the case anydoc cannot model: engines.go keeps it on builtin.
+    assert.equal(vm.getEngineForGroup(['pdf']), 'builtin')
+    for (const group of [['md', 'markdown'], ['txt'], ['csv'], ['json'], ['jpg', 'jpeg', 'png']]) {
+      assert.equal(vm.getEngineForGroup(group), 'simple', `${group} stays on the Go reader`)
+    }
+    for (const group of [['docx', 'doc'], ['xlsx', 'xls'], ['pptx', 'ppt']]) {
+      assert.equal(vm.getEngineForGroup(group), 'anydoc', `${group} prefers anydoc`)
+    }
+    assert.equal(vm.getEngineForGroup(['mhtml']), 'builtin', 'anydoc does not claim mhtml')
+  } finally { unmount() }
+})
+
+test('with anydoc unavailable only ppt/pptx leave builtin for a pinned engine', async () => {
+  const { vm, unmount } = await mountParserSettings(
+    registryEngines.map(e => (e.Name === 'anydoc' ? { ...e, Available: false } : e)),
+  )
+  try {
+    assert.equal(vm.getEngineForGroup(['pdf']), 'builtin')
+    assert.equal(vm.getEngineForGroup(['pptx', 'ppt']), 'markitdown', 'knowledgebase.go pins ppt/pptx')
+    assert.equal(vm.getEngineForGroup(['docx', 'doc']), 'builtin')
+    assert.equal(vm.getEngineForGroup(['xlsx', 'xls']), 'builtin')
+    assert.equal(vm.getEngineForGroup(['md', 'markdown']), 'simple')
+  } finally { unmount() }
+})
 
 test('assistant changes warn without overwriting unsaved agent settings', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
